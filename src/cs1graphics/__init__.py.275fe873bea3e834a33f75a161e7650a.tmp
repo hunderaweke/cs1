@@ -66,7 +66,7 @@ except ImportError:
 try:
     import PIL.Image as _Image
     import PIL.ImageDraw as _ImageDraw
-    import PIL.ImageTkImageTk as _ImageTk
+    import PIL.ImageTk as _ImageTk
 except ImportError:
     raise ImportError('cs1graphics requires that PIL be installed')
 _pilAvailable = True
