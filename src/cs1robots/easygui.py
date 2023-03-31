@@ -45,15 +45,15 @@ __all__ = ['ynbox'
 	]
 
 import sys, os
-from Tkinter import *
+from tkinter import *
 if TkVersion < 8.0 :
-	print "\n" * 3
-	print "*"*75
-	print "Running Tk version:", TkVersion
-	print "You must be using Tk version 8.0 or greater to use EasyGui."
-	print "Terminating."
-	print "*"*75
-	print "\n" * 3
+	print ("\n" * 3)
+	print ("*"*75)
+	print ("Running Tk version:", TkVersion)
+	print ("You must be using Tk version 8.0 or greater to use EasyGui.")
+	print ("Terminating.")
+	print ("*"*75)
+	print ("\n" * 3)
 	sys.exit(0)
 
 def dq(s): return '"%s"' % s
@@ -70,7 +70,7 @@ CODEBOX_FONT_SIZE     =  9
 TEXTBOX_FONT_SIZE     = DEFAULT_FONT_SIZE
 
 
-import tkFileDialog
+from tkinter import filedialog
 
 #-------------------------------------------------------------------
 # various boxes built on top of the basic buttonbox
@@ -1248,7 +1248,7 @@ def __put_buttons_in_buttonframe(choices):
 #-----------------------------------------------------------------------
 def _test():
 	# simple way to clear the console
-	print "\n" * 100
+	print ("\n" * 100)
 	# START DEMONSTRATION DATA ===================================================
 	choices_abc = ["This is choice 1", "And this is choice 2"]
 	msg = "Pick one! This is a huge choice, and you've got to make the right one " \
@@ -1325,7 +1325,7 @@ for someItem in myListOfStuff:
 
 		if   reply[0] == "msgbox":
 			reply = msgbox("short msg", "This is a long title")
-			print "Reply was:", repr(reply)
+			print ("Reply was:", repr(reply))
 
 		elif reply[0] == "About":
 			reply = abouteasygui()
@@ -1335,94 +1335,94 @@ for someItem in myListOfStuff:
 
 		elif reply[0] == "buttonbox":
 			reply = buttonbox()
-			print "Reply was:", repr(reply)
+			print ("Reply was:", repr(reply))
 
 			reply = buttonbox(msg=msg
 			, title="Demo of Buttonbox with many, many buttons!"
 			, choices=choices)
-			print "Reply was:", repr(reply)
+			print ("Reply was:", repr(reply))
 
 		elif reply[0] == "buttonbox(image)":
 			image = "python_and_check_logo.gif"
 
 			msg   = "Pretty nice, huh!"
 			reply=msgbox(msg,image=image, ok_button="Wow!")
-			print "Reply was:", repr(reply)
+			print ("Reply was:", repr(reply))
 
 			msg   = "Do you like this picture?"
 			choices = ["Yes","No","No opinion"]
 
 			reply=buttonbox(msg,image=image,choices=choices)
-			print "Reply was:", repr(reply)
+			print ("Reply was:", repr(reply))
 
 			image = os.path.normpath("python_and_check_logo.png")
 			reply=buttonbox(msg,image=image, choices=choices)
-			print "Reply was:", repr(reply)
+			print ("Reply was:", repr(reply))
 
 			image = os.path.normpath("zzzzz.gif")
 			reply=buttonbox(msg,image=image, choices=choices)
-			print "Reply was:", repr(reply)
+			print ("Reply was:", repr(reply))
 
 		elif reply[0] == "boolbox":
 			reply = boolbox()
-			print "Reply was:", repr(reply)
+			print ("Reply was:", repr(reply))
 
 		elif reply[0] == "enterbox":
 			message = "Enter the name of your best friend."\
 			          "\n(Result will be stripped.)"
 			reply = enterbox(message, "Love!", "     Suzy Smith     ")
-			print "Reply was:", repr(reply)
+			print ("Reply was:", repr(reply))
 
 			message = "Enter the name of your best friend."\
 			          "\n(Result will NOT be stripped.)"
 			reply = enterbox(message, "Love!", "     Suzy Smith     ",strip=False)
-			print "Reply was:", repr(reply)
+			print ("Reply was:", repr(reply))
 
 			reply = enterbox("Enter the name of your worst enemy:", "Hate!")
-			print "Reply was:", repr(reply)
+			print ("Reply was:", repr(reply))
 
 		elif reply[0] == "integerbox":
 			reply = integerbox(
 				"Enter a number between 3 and 333",
 				"Demo: integerbox WITH a default value",
 				222, 3, 333)
-			print "Reply was:", repr(reply)
+			print ("Reply was:", repr(reply))
 
 			reply = integerbox(
 				"Enter a number between 0 and 99",
 				"Demo: integerbox WITHOUT a default value"
 				)
-			print "Reply was:", repr(reply)
+			print ("Reply was:", repr(reply))
 
 		elif reply[0] == "diropenbox":
 			title = "Demo of diropenbox"
 			msg = "This is a test of the diropenbox.\n\nPick the directory that you wish to open."
 			d = diropenbox(msg, title)
-			print "You chose directory...:", d
+			print ("You chose directory...:", d)
 
 		elif reply[0] == "fileopenbox":
 			f = fileopenbox()
-			print "You chose to open file:", f
+			print ("You chose to open file:", f)
 
 		elif reply[0] == "filesavebox":
 			f = filesavebox()
-			print "You chose to save file:", f
+			print ("You chose to save file:", f)
 
 		elif reply[0] == "indexbox":
 			title = reply[0]
 			msg   =  "Demo of " + reply[0]
 			choices = ["Choice1", "Choice2", "Choice3", "Choice4"]
 			reply = indexbox(msg, title, choices)
-			print "Reply was:", repr(reply)
+			print ("Reply was:", repr(reply))
 
 		elif reply[0] == "passwordbox":
 			reply = passwordbox("Demo of password box WITHOUT default"
 				+ "\n\nEnter your secret password", "Member Logon")
-			print "Reply was:", str(reply)
+			print ("Reply was:", str(reply))
 
 			reply = passwordbox("Demo of password box WITH default"
 				+ "\n\nEnter your secret password", "Member Logon", "alfie")
-			print "Reply was:", str(reply)
+			print ("Reply was:", str(reply))
 
 		elif reply[0] == "multenterbox":
 			msg = "Enter your personal information"
@@ -1441,7 +1441,7 @@ for someItem in myListOfStuff:
 				if errmsg == "": break # no problems found
 				fieldValues = multenterbox(errmsg, title, fieldNames, fieldValues)
 
-			print "Reply was:", fieldValues
+			print ("Reply was:", fieldValues)
 
 		elif reply[0] == "multpasswordbox":
 			msg = "Enter logon information"
@@ -1460,16 +1460,16 @@ for someItem in myListOfStuff:
 				if errmsg == "": break # no problems found
 				fieldValues = multpasswordbox(errmsg, title, fieldNames, fieldValues)
 
-			print "Reply was:", fieldValues
+			print ("Reply was:", fieldValues)
 
 
 		elif reply[0] == "ynbox":
 			reply = ynbox(msg, title)
-			print "Reply was:", repr(reply)
+			print ("Reply was:", repr(reply))
 
 		elif reply[0] == "ccbox":
 			reply = ccbox(msg)
-			print "Reply was:", repr(reply)
+			print ("Reply was:", repr(reply))
 
 		elif reply[0] == "choicebox":
 			longchoice = "This is an example of a very long option which you may or may not wish to choose."*2
@@ -1478,15 +1478,15 @@ for someItem in myListOfStuff:
 
 			msg = "Pick something. " + ("A wrapable sentence of text ?! "*30) + "\nA separate line of text."*6
 			reply = choicebox(msg=msg, choices=listChoices)
-			print "Reply was:", repr(reply)
+			print ("Reply was:", repr(reply))
 
 			msg = "Pick something. "
 			reply = choicebox(msg=msg, choices=listChoices)
-			print "Reply was:", repr(reply)
+			print ("Reply was:", repr(reply))
 
 			msg = "Pick something. "
 			reply = choicebox(msg="The list of choices is empty!", choices=[])
-			print "Reply was:", repr(reply)
+			print ("Reply was:", repr(reply))
 
 		elif reply[0] == "multchoicebox":
 			listChoices = ["aaa", "bbb", "ccc", "ggg", "hhh", "iii", "jjj", "kkk"
@@ -1495,17 +1495,17 @@ for someItem in myListOfStuff:
 
 			msg = "Pick as many choices as you wish."
 			reply = multchoicebox(msg,"DEMO OF multchoicebox", listChoices)
-			print "Reply was:", repr(reply)
+			print ("Reply was:", repr(reply))
 
 		elif reply[0] == "textbox":
 			msg = "Here is some sample text. " * 16
 			reply = textbox(msg, "Text Sample", text_snippet)
-			print "Reply was:", repr(reply)
+			print ("Reply was:", repr(reply))
 
 		elif reply[0] == "codebox":
 			msg = "Here is some sample code. " * 16
 			reply = codebox(msg, "Code Sample", code_snippet)
-			print "Reply was:", repr(reply)
+			print ("Reply was:", repr(reply))
 
 		else:
 			msgbox("Choice\n\n" + choice + "\n\nis not recognized", "Program Logic Error")
