@@ -1,0 +1,15 @@
+README.md
+setup.cfg
+setup.py
+src/cs1_robots.egg-info/PKG-INFO
+src/cs1_robots.egg-info/SOURCES.txt
+src/cs1_robots.egg-info/dependency_links.txt
+src/cs1_robots.egg-info/requires.txt
+src/cs1_robots.egg-info/top_level.txt
+src/cs1graphics/__init__.py
+src/cs1graphics/easygui.py
+src/cs1media/__init__.py
+src/cs1media/easygui.py
+src/cs1robots/__init__.py
+src/cs1robots/cs1robots_images.py
+src/cs1robots/easygui.py
