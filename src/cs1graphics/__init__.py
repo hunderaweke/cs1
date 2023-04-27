@@ -1,13 +1,18 @@
 """cs1graphics.py
 
-Copyright 2008-2012, David Letscher and Michael H. Goldwasser
+Copyright 2008-2014, David Letscher, Michael H. Goldwasser, Christopher Porter
 
 Go to www.cs1graphics.org for more information.
 
-This is Version 1.2a2 alpha bugfix release (18 January 2012)
-       Detabified (15 April 2012)
-"""
+This is Version 1.2 multithreaded release (23 July 2014)
 
+Modified by Jungkook Park for KAIST CS101. (24 Nov 2015)
+- Use Pillow instead of PIL.
+- Allow base64 image extension.
+- FIx ImportError for _tempfile.
+- Add function saveToIO.
+- Make periodic function call. 
+"""
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
@@ -22,26 +27,78 @@ This is Version 1.2a2 alpha bugfix release (18 January 2012)
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 
-# Configuration Options
-_nativeThreading = False     # if True, this allows for true multi-threading
-_mathMode = False            # if True, coordinate system uses lower-left origin
-_RECURSIVE_LIMIT = 10
-_debug = 0
-_dashMultiplier = 2          # oddity about whether pattern should be (a,b) or (a,b,a,b)
+# If you are interested in doing further development of cs1graphics,
+# please contact the authors to receive the Developer's Guide.
 
-import copy as _copy
-import math as _math
-import random as _random
-import time as _time
-import threading as _threading
-import atexit as _atexit
+
+# Configuration Options:
+# ----------------------
+
+# By default, cs1graphics uses true multi-threading. However, the
+# default Python/Tk implementation shipped on many versions of Apple's
+# OSX operating system does not allow for such support. The following
+# flag should be changed to False to switch to a slightly more limited
+# model of threading. This behavior can also be triggered
+# programmatically by calling configureNativeThreading(False) prior to
+# issuing any graphics commands.
+
 import tempfile as _tempfile
-import os as _os
-import sys as _sys
-import traceback as _traceback
-from array import array as _array
-from io import StringIO as _cStringIO
+import io as _io
 import base64 as _base64
+from array import array as _array
+import traceback as _traceback
+import sys as _sys
+import os as _os
+import atexit as _atexit
+import threading as _threading
+import time as _time
+import random as _random
+import math as _math
+import copy as _copy
+_nativeThreading = False
+
+# By default, cs1graphics uses the common "computer science"
+# coordinate system, with the origin in the top-left corner of a
+# window, and with the y-axis oriented so that positive values are
+# below the origin. To get a traditional "mathematics" coordinate
+# system, with the origin in the bottom-left and the positive y-axis
+# oriented above the origin, the following flag can be changed to
+# True. This behavior can also be triggered programmatically by
+# calling configureMathMode(True) prior to issuing any graphics
+# commands.
+
+_mathMode = False
+
+# cs1graphics allows for a layer to be recursively nested within
+# itself, for some cool effects. The rendering of such recursion is
+# artificially capped with the following recursive limit. This limit
+# may also be changed programmatically with the
+# configureSetRecursionLimit function.
+
+_RECURSIVE_LIMIT = 10
+
+# The following dictionary of flags should only be used by developers
+# to adjust the level of verbosity when debugging various aspects of
+# the system.
+
+_DEBUG = {
+    'wait': 0,
+    'mainLoop': 0,
+    'processEvents': 0,
+    'Events': 0,
+    'Tkinter': 0,
+    'Front': 0,
+    'Middle': 0,
+    'RenderedH': 0,
+    'UpdateManager': 0,
+    'processCommands': 0,
+}
+
+# oddity about whether pattern should be (a,b) or (a,b,a,b)
+_dashMultiplier = 2
+
+_elice_use = False
+
 
 # change in module names for Python 2 vs 3
 try:
@@ -50,32 +107,39 @@ except ImportError:
     import queue as _Queue     # Python 3
 
 
-try:    
+try:
     import thread as _thread
 except ImportError:
     import _thread as _thread  # Python 3
 
-try:    
+try:
     import Tkinter as _Tkinter
 except ImportError:
     try:
-        import tkinter as _Tkinter # Python 3
+        import tkinter as _Tkinter  # Python 3
     except ImportError:
         raise ImportError('cs1graphics requires that Tkinter be installed')
 
 try:
-    import PIL.Image as _Image
-    import PIL.ImageDraw as _ImageDraw
-    import PIL.ImageTk as _ImageTk
+    from PIL import Image as _Image
+    from PIL import ImageTk as _ImageTk
+    _pilAvailable = True
 except ImportError:
-    raise ImportError('cs1graphics requires that PIL be installed')
-_pilAvailable = True
+    _pilAvailable = False
+
+
+try:
+    from cStringIO import StringIO as _Base64IO
+except ImportError:
+    from io import BytesIO as _Base64IO
+
 
 # Library
 _tkroot = None
 
 _ourRandom = _random.Random()
-_ourRandom.seed(1234)     # initialize the random seed so that behaviors are reproducible
+# initialize the random seed so that behaviors are reproducible
+_ourRandom.seed(1234)
 
 # support for Python 2.x/3.x.
 # We want to use isinstance(foo, basestring) in either case
@@ -86,34 +150,36 @@ except NameError:
 
 
 # Global Configuration Controls
-def configureNativeThreading():
-    """Configures cs1graphics to run in native multi-threaded mode.
+def configureNativeThreading(flag=False):
+    """Configures cs1graphics to run in native multi-threaded mode when flag is True.
 
-    By default, the library is predominantly single-threaded, with all
-    rendering in the primary thread and EventHandlers activated only
-    when the end of the main thread is reached, or an explicit
-    (blocking) call to startEventHandling() is made.
+    By default, the library uses a multi-threaded model in which case
+    all rendering is managed by a secondary thread, and EventHandlers
+    are immediately activated once registered without blocking the
+    primary thread.
 
-    On systems that support accessing Tkinter from a secondary thread,
-    an initial call to this function switches to a multi-threaded
-    model in which case all rendering is managed by a secondary
-    thread, and EventHandlers are immediately activated once
-    registered without blocking the primary thread.
+    However, on systems that do not support accessing Tkinter from a
+    secondary thread, the model can be changed to be single-threaded,
+    with all rendering in the primary thread and EventHandlers
+    activated only when the end of the main thread is reached, or an
+    explicit (blocking) call to startEventHandling() is made.
 
     Note: This command must be executed prior to the use of any core
     library functionality.
 
     Note: As an alternative, your cs1graphics installation can be
-    configured to use native threading as the default mode by setting
-    the variable, _nativeThread = True, in the file cs1graphics.py.
+    configured with the default mode set using the variable
+    _nativeThread in the preamble of file cs1graphics.py.
     """
     if _graphicsManager._state != 'Initial':
-        raise GraphicsError('configuration must occur prior to other use of the library')
+        raise GraphicsError(
+            'configuration must occur prior to other use of the library')
     global _nativeThreading
     _nativeThreading = True
 
-def configureMathMode():
-    """Forces cs1graphics to use standard math coordinate system.
+
+def configureMathMode(flag=True):
+    """Forces cs1graphics to use standard math coordinate system when flag is True.
 
     By default, cs1graphics uses a standard computer graphics
     coordinate system with the origin at the top-left and the positive
@@ -128,13 +194,15 @@ def configureMathMode():
     library functionality.
 
     Note: As an alternative, your cs1graphics installation can be
-    configured to use the math coordinate system by default by setting
-    the variable, _mathMode = True, in the file cs1graphics.py.
+    configured with the default coordinate system set using the
+    variable _mathMode in the preamble of file cs1graphics.py.
     """
     if _graphicsManager._state != 'Initial':
-        raise GraphicsError('configuration must occur prior to other use of the library')
+        raise GraphicsError(
+            'configuration must occur prior to other use of the library')
     global _mathMode
-    _mathMode = True
+    _mathMode = flag
+
 
 def configureSetRecursionLimit(limit):
     """Changes the limit on recursion for drawable inclusion.
@@ -145,7 +213,8 @@ def configureSetRecursionLimit(limit):
     This function allows that to be changed.
     """
     if _graphicsManager._state != 'Initial':
-        raise GraphicsError('configuration must occur prior to other use of the library')
+        raise GraphicsError(
+            'configuration must occur prior to other use of the library')
     if not isinstance(limit, int):
         raise TypeError('limit should be an integer')
     if limit < 1:
@@ -153,447 +222,477 @@ def configureSetRecursionLimit(limit):
     global _RECURSIVE_LIMIT
     _RECURSIVE_LIMIT = limit
 
-    
+
 class GraphicsError(Exception):
+
     def __init__(self, message, recoverable=False):
-        Exception.__init__(self, message)
+        super(GraphicsError, self).__init__()
         self._recoverable = recoverable
 
 
 # Data structures
+
+
+# special purpose comparator for chains, since Python3 no longer allows
+# for us to use default < for chain tuples that include a class instance.
+
+def _chainCompare(a, b):
+    return _chainCompareRecurse(a, b, 0)
+
+
+def _chainCompareRecurse(a, b, k):
+    """Compare implicit slices a[k:] and b[k:]"""
+    if len(a) == k:
+        return len(b) > k
+    elif len(b) == k:
+        return False
+    elif a[k][0] < b[k][0]:
+        return True
+    elif b[k][0] < a[k][0]:
+        return False
+    elif a[k][1] == b[k][1]:
+        return _chainCompareRecurse(a, b, k + 1)
+    else:
+        # arbitrary tie-breaker for our model of chains with multiple inheritance
+        return str(a[k][1]) < str(b[k][1])
+
+
 class _OrderedMap:
 
-  """Implements an ordered map.
+    """Implements an ordered map.
 
-  Although we do not formally require the keys to be hashable, the
-  expectation is that they should not be mutated.
+    Although we do not formally require the keys to be hashable, the
+    expectation is that they should not be mutated.
 
-  By default, ordering is based on < operator, but the user
-  can provide a non-standard boolean function for comparing keys.
-  
-  This implementation is based upon an underlying treap.
+    By default, ordering is based on < operator, but the user
+    can provide a non-standard boolean function for comparing keys.
 
-  """
-
-  def _less(a, b):
-    """Generic version of comparison function."""
-    return a < b
-  _less = staticmethod(_less)
-
-  def __init__(self, less=None):
-    """Create an empty map.
-
-    less is a boolean function with callingsignature less(keyA, keyB)
-    that returns True if keyA is strictly less than keyB.
-
-    If not sent, the default < operator is used.
+    This implementation is based upon an underlying treap.
 
     """
-    self._root = None
-    self._size = 0
-    if less is not None:
-      self._less = less
 
-  def __len__(self):
-    """Return the size of the map."""
-    return self._size
+    def _less(a, b):
+        """Generic version of comparison function."""
+        return a < b
+    _less = staticmethod(_less)
 
-  def _trace(self, key):
-    """Walk path looking for given key.
+    def __init__(self, less=None):
+        """Create an empty map.
 
-    Return the node that has the key, if any.
-    Otherwise return the last true node visited.
-    In case of an empty map, None is returned.
+        less is a boolean function with callingsignature less(keyA, keyB)
+        that returns True if keyA is strictly less than keyB.
 
-    """
-    if len(self) > 0:
-      walk = self._root
-      while walk is not None and \
-            (self._less(key, walk.key) or self._less(walk.key, key)):
-        # no match thus far
-        trail = walk
+        If not sent, the default < operator is used.
+
+        """
+        self._root = None
+        self._size = 0
+        if less is not None:
+            self._less = less
+
+    def __len__(self):
+        """Return the size of the map."""
+        return self._size
+
+    def _trace(self, key):
+        """Walk path looking for given key.
+
+        Return the node that has the key, if any.
+        Otherwise return the last true node visited.
+        In case of an empty map, None is returned.
+
+        """
+        if len(self) > 0:
+            walk = self._root
+            while walk is not None and \
+                    (self._less(key, walk.key) or self._less(walk.key, key)):
+                # no match thus far
+                trail = walk
+                if self._less(key, walk.key):
+                    walk = walk.left
+                else:
+                    walk = walk.right
+            if walk is not None:
+                result = walk
+            else:
+                result = trail
+        else:
+            result = None
+
+        return result
+
+    def __delitem__(self, key):
+        """Remove the entry assoicated with the key.
+
+        KeyError results if key does not exist.
+
+        """
+        temp = self.find(key)
+        if temp is None:
+            raise KeyError(repr(key))
+        self.remove(temp)
+
+    def __getitem__(self, key):
+        """Return the value associated with the key.
+
+        KeyError results if key does not exist.
+        """
+        temp = self.find(key)
+        if temp is None:
+            raise KeyError(repr(key))
+        else:
+            return temp.value()
+
+    def __setitem__(self, key, value):
+        """Associate key to value.
+
+        If key exists, old value is overwritten with new.
+        If key does not exist, it is added to the map.
+
+        """
+        self.insert(key, value)   # ignore return value
+
+    def find(self, key):
+        """Return an iterator to the key's position, if found.
+
+        None is returned if key not found.
+
+        """
+        walk = self._trace(key)
+        if walk is not None and not \
+           (self._less(key, walk.key) or self._less(walk.key, key)):
+            return _OrderedMap.iterator(walk)
+        else:
+            return None
+
+    def __contains__(self, key):
+        """Return True if key in the map."""
+        return self.find(key) is not None
+
+    def first(self):
+        """Return iterator to the first element of the map.
+
+        None is returned if map is empty.
+
+        """
+        if len(self) > 0:
+            return _OrderedMap.iterator(self._root.subtreeMin())
+        else:
+            return None
+
+    def last(self):
+        """Return iterator to the last element of the map.
+
+        None is returned if map is empty.
+
+        """
+        if len(self) > 0:
+            return _OrderedMap.iterator(self._root.subtreeMax())
+        else:
+            return None
+
+    def __iter__(self):
+        """Return generator for (key,value) pairs."""
+        walk = self.first()
+        while walk is not None:
+            yield (walk.key(), walk.value())
+            walk = walk.next()
+
+    def closestBefore(self, key, strict=True):
+        """Return iterator to position at or before the key.
+
+        With strict=True (the default), the search looks for an item
+        that has a key strictly smaller than the given one.
+
+        With strict=False, it will return an exact match if possible, and
+        otherwise the closest before.
+
+        Will return None in the case that no earlier key is found.
+
+        """
+        walk = self._trace(key)
+        if walk is None:
+            return None
+        if self._less(walk.key, key):
+            # this is strictly smaller than key, so it must be it
+            return _OrderedMap.iterator(walk)
+        elif not (strict or self._less(key, walk.key)):
+            # use the exact match
+            return _OrderedMap.iterator(walk)
+        elif walk.left is not None:
+            # found an exact match, and it has lesser children
+            return _OrderedMap.iterator(walk.left.subtreeMax())
+        else:
+            # start walking upward
+            while walk is not None and not self._less(walk.key, key):
+                walk = walk.parent
+            if walk is not None:
+                return _OrderedMap.iterator(walk)
+            else:
+                return None
+
+    def closestAfter(self, key, strict=True):
+        """Return iterator to position at or after the key.
+
+        With strict=True (the default), the search looks for an item
+        that has a key strictly larger than the given one.
+
+        With strict=False, it will return an exact match if possible, and
+        otherwise the closest after.
+
+        Will return None in the case that no later key is found.
+
+        """
+        walk = self._trace(key)
         if self._less(key, walk.key):
-          walk = walk.left
+            # this is strictly larger than key, so it must be it
+            return _OrderedMap.iterator(walk)
+        elif not (strict or self._less(walk.key, key)):
+            # use the exact match
+            return _OrderedMap.iterator(walk)
+        elif walk.right is not None:
+            # found an exact match, and it has greater children
+            return _OrderedMap.iterator(walk.right.subtreeMin())
         else:
-          walk = walk.right
-      if walk is not None:
-        result =  walk
-      else:
-        result =  trail
-    else:
-      result = None
+            # start walking upward
+            while walk is not None and not self._less(key, walk.key):
+                walk = walk.parent
+            if walk is not None:
+                return _OrderedMap.iterator(walk)
+            else:
+                return None
 
-    return result
+    def insert(self, key, value=None):
+        """Associate key to value.
 
-  def __delitem__(self, key):
-    """Remove the entry assoicated with the key.
+        If key exists, old value is overwritten with new.
+        If key does not exist, it is added to the map.
 
-    KeyError results if key does not exist.
+        Return an iterator to the key's position.
 
-    """
-    temp = self.find(key)
-    if temp is None:
-      raise KeyError(repr(key))
-    self.remove(temp)
-
-  def __getitem__(self, key):
-    """Return the value associated with the key.
-
-    KeyError results if key does not exist.
-    """
-    temp = self.find(key)
-    if temp is None:
-      raise KeyError(repr(key))
-    else:
-      return temp.value()
-
-  def __setitem__(self, key, value):
-    """Associate key to value.
-
-    If key exists, old value is overwritten with new.
-    If key does not exist, it is added to the map.
-
-    """
-    self.insert(key, value)   # ignore return value
-
-  def find(self, key):
-    """Return an iterator to the key's position, if found.
-
-    None is returned if key not found.
-
-    """
-    walk = self._trace(key)
-    if walk is not None and not \
-       (self._less(key, walk.key) or self._less(walk.key, key)):
-      return _OrderedMap.iterator(walk)
-    else:
-      return None
-
-  def __contains__(self, key):
-    """Return True if key in the map."""
-    return self.find(key) is not None
-
-  def first(self):
-    """Return iterator to the first element of the map.
-    
-    None is returned if map is empty.
-
-    """
-    if len(self) > 0:
-      return _OrderedMap.iterator(self._root.subtreeMin())
-    else:
-      return None
-
-  def last(self):
-    """Return iterator to the last element of the map.
-    
-    None is returned if map is empty.
-
-    """
-    if len(self) > 0:
-      return _OrderedMap.iterator(self._root.subtreeMax())
-    else:
-      return None
-
-  def __iter__(self):
-    """Return generator for (key,value) pairs."""
-    walk = self.first()
-    while walk is not None:
-      yield (walk.key(), walk.value())
-      walk = walk.next()
-
-  def closestBefore(self, key, strict=True):
-    """Return iterator to position at or before the key.
-
-    With strict=True (the default), the search looks for an item
-    that has a key strictly smaller than the given one.
-
-    With strict=False, it will return an exact match if possible, and
-    otherwise the closest before.
-
-    Will return None in the case that no earlier key is found.
-
-    """
-    walk = self._trace(key)
-    if walk is None:
-      return None
-    if self._less(walk.key, key):
-      # this is strictly smaller than key, so it must be it
-      return _OrderedMap.iterator(walk)
-    elif not (strict or self._less(key, walk.key)):
-      # use the exact match
-      return _OrderedMap.iterator(walk)
-    elif walk.left is not None:
-      # found an exact match, and it has lesser children
-      return _OrderedMap.iterator(walk.left.subtreeMax())
-    else:
-      # start walking upward
-      while walk is not None and not self._less(walk.key, key):
-        walk = walk.parent
-      if walk is not None:
-        return _OrderedMap.iterator(walk)
-      else:
-        return None
-
-  def closestAfter(self, key, strict=True):
-    """Return iterator to position at or after the key.
-
-    With strict=True (the default), the search looks for an item
-    that has a key strictly larger than the given one.
-
-    With strict=False, it will return an exact match if possible, and
-    otherwise the closest after.
-
-    Will return None in the case that no later key is found.
-
-    """
-    walk = self._trace(key)
-    if self._less(key, walk.key):
-      # this is strictly larger than key, so it must be it
-      return _OrderedMap.iterator(walk)
-    elif not (strict or self._less(walk.key, key)):
-      # use the exact match
-      return _OrderedMap.iterator(walk)
-    elif walk.right is not None:
-      # found an exact match, and it has greater children
-      return _OrderedMap.iterator(walk.right.subtreeMin())
-    else:
-      # start walking upward
-      while walk is not None and not self._less(key, walk.key):
-        walk = walk.parent
-      if walk is not None:
-        return _OrderedMap.iterator(walk)
-      else:
-        return None
-
-  def insert(self, key, value=None):
-    """Associate key to value.
-
-    If key exists, old value is overwritten with new.
-    If key does not exist, it is added to the map.
-
-    Return an iterator to the key's position.
-
-    """
-    walk = self._trace(key)
-    if walk is None:
-      self._size += 1
-      self._root = _OrderedMap._node(key, value)
-      return _OrderedMap.iterator(self._root)
-    else:
-      if self._less(key, walk.key):
-        walk.left = _OrderedMap._node(key, value, walk)
-        walk = walk.left
-        self._insertRebalance(walk)
-        self._size += 1
-      elif self._less(walk.key, key):
-        walk.right = _OrderedMap._node(key, value, walk)
-        walk = walk.right
-        self._insertRebalance(walk)
-        self._size += 1
-      else:
-        # key exists;  overwrite old value
-        walk.val = value
-      return _OrderedMap.iterator(walk)
-
-  def _insertRebalance(self, walk):
-    while walk.parent is not None and walk.priority < walk.parent.priority:
-      self._rotateUp(walk)
-
-  def remove(self, posn):
-    """Remove the item at the given iterator."""
-
-    if not isinstance(posn, self.iterator):
-      raise TypeError("Must provide valid iterator for remove")
-    
-    self._size -= 1
-    walk = posn._nd
-    if walk.left is None or walk.right is None:
-      self._easyDelete(walk)
-    else:
-      # use predecessor as sub for the current node
-      sub = walk.left.subtreeMax()
-
-      # fix pointer from above
-      if self._root is walk:
-        self._root = sub
-      elif walk is walk.parent.left:
-        walk.parent.left = sub
-      else:
-        walk.parent.right = sub
-
-      # relocate sub and remove walk
-      if sub is not walk.left:
-        # clean up below
-        sub.parent.right = sub.left
-        if sub.left is not None:
-          sub.left.parent = sub.parent
-        # sub takes over left child of walk
-        sub.left = walk.left
-        walk.left.parent = sub
-      # sub takes over right child of walk
-      sub.right = walk.right
-      walk.right.parent = sub
-      # sub gets new parent
-      sub.parent = walk.parent
-      # restore heap property from sub downward
-      downward = True
-      while downward:
-        child = sub.left
-        if sub.right is not None and (child is None or sub.right.priority < child.priority):
-          child = sub.right
-        if child is not None and child.priority < sub.priority:
-          self._rotateUp(child)
+        """
+        walk = self._trace(key)
+        if walk is None:
+            self._size += 1
+            self._root = _OrderedMap._node(key, value)
+            return _OrderedMap.iterator(self._root)
         else:
-          downward = False
+            if self._less(key, walk.key):
+                walk.left = _OrderedMap._node(key, value, walk)
+                walk = walk.left
+                self._insertRebalance(walk)
+                self._size += 1
+            elif self._less(walk.key, key):
+                walk.right = _OrderedMap._node(key, value, walk)
+                walk = walk.right
+                self._insertRebalance(walk)
+                self._size += 1
+            else:
+                # key exists;  overwrite old value
+                walk.val = value
+            return _OrderedMap.iterator(walk)
 
-  def _rotateUp(self, walk):
-    """Rotate node walk up one level.
-    
-    Assumes that walk is not the root (but parent may be)
+    def _insertRebalance(self, walk):
+        while walk.parent is not None and walk.priority < walk.parent.priority:
+            self._rotateUp(walk)
 
-    """
-    parent = walk.parent
-    grand = parent.parent
-    walk.parent = grand
-    parent.parent = walk
-    if parent.left is walk:
-      parent.left = walk.right
-      if walk.right is not None:
-        walk.right.parent = parent
-      walk.right = parent
-    else:
-      parent.right = walk.left
-      if walk.left is not None:
-        walk.left.parent = parent
-      walk.left = parent
-    if grand is None:
-      self._root = walk
-    else:
-      if grand.left is parent:
-        grand.left = walk
-      else:
-        grand.right = walk
+    def remove(self, posn):
+        """Remove the item at the given iterator."""
 
-  def _easyDelete(self, walk):
-    """Assumes that walk is a node that has at most one child."""
-    if walk.left is None:
-      child = walk.right
-    else:
-      child = walk.left
+        if not isinstance(posn, self.iterator):
+            raise TypeError("Must provide valid iterator for remove")
 
-    if child is not None:
-      child.parent = walk.parent
-    
-    if walk.parent is None:
-      self._root = child
-    else:
-      if walk is walk.parent.left:
-        walk.parent.left = child
-      else:
-        walk.parent.right = child
-    walk.parent = walk.left = walk.right = None   # disconnect, to be safe
+        self._size -= 1
+        walk = posn._nd
+        if walk.left is None or walk.right is None:
+            self._easyDelete(walk)
+        else:
+            # use predecessor as sub for the current node
+            sub = walk.left.subtreeMax()
 
+            # fix pointer from above
+            if self._root is walk:
+                self._root = sub
+            elif walk is walk.parent.left:
+                walk.parent.left = sub
+            else:
+                walk.parent.right = sub
 
-  ###################################################
-  ######### nested class _OrderedMap._node ##########
-  class _node:
-    __slots__ = ('key', 'val', 'parent', 'left', 'right', 'priority')   # optimization
+            # relocate sub and remove walk
+            if sub is not walk.left:
+                # clean up below
+                sub.parent.right = sub.left
+                if sub.left is not None:
+                    sub.left.parent = sub.parent
+                # sub takes over left child of walk
+                sub.left = walk.left
+                walk.left.parent = sub
+            # sub takes over right child of walk
+            sub.right = walk.right
+            walk.right.parent = sub
+            # sub gets new parent
+            sub.parent = walk.parent
+            # restore heap property from sub downward
+            downward = True
+            while downward:
+                child = sub.left
+                if sub.right is not None and (child is None or sub.right.priority < child.priority):
+                    child = sub.right
+                if child is not None and child.priority < sub.priority:
+                    self._rotateUp(child)
+                else:
+                    downward = False
 
-    """Simple struct to represent node of the treap"""
-    def __init__(self, key, value=None, parent = None, leftChild = None, rightChild = None):
-      self.key = key
-      self.val = value
-      self.parent = parent
-      self.left = leftChild
-      self.right = rightChild
-      self.priority = _ourRandom.random()
+    def _rotateUp(self, walk):
+        """Rotate node walk up one level.
 
-    def subtreeMin(self):
-      """Return leftmost node of subtree."""
-      walk = self
-      while walk.left is not None:
-        walk = walk.left
-      return walk
+        Assumes that walk is not the root (but parent may be)
 
-    def subtreeMax(self):
-      """Return rightmost node of subtree."""
-      walk = self
-      while walk.right is not None:
-        walk = walk.right
-      return walk
+        """
+        parent = walk.parent
+        grand = parent.parent
+        walk.parent = grand
+        parent.parent = walk
+        if parent.left is walk:
+            parent.left = walk.right
+            if walk.right is not None:
+                walk.right.parent = parent
+            walk.right = parent
+        else:
+            parent.right = walk.left
+            if walk.left is not None:
+                walk.left.parent = parent
+            walk.left = parent
+        if grand is None:
+            self._root = walk
+        else:
+            if grand.left is parent:
+                grand.left = walk
+            else:
+                grand.right = walk
 
-    def predecessor(self):
-      """Returns node of predecessor.  Returns None if this is minimum."""
-      if self.left is not None:
-        return self.left.subtreeMax()
-      else:
-        walk = self
-        while walk.parent is not None and walk.parent.left is walk:
-          walk = walk.parent
-        return walk.parent
-        
-    def successor(self):
-      """Returns node of successor.  Returns None if this is maximum."""
-      if self.right is not None:
-        return self.right.subtreeMin()
-      else:
-        walk = self
-        while walk.parent is not None and walk.parent.right is walk:
-          walk = walk.parent
-        return walk.parent
+    def _easyDelete(self, walk):
+        """Assumes that walk is a node that has at most one child."""
+        if walk.left is None:
+            child = walk.right
+        else:
+            child = walk.left
 
-  ######### end of class _OrderedMap._node ##########
+        if child is not None:
+            child.parent = walk.parent
 
-    
-  ######################################################
-  ######### nested class _OrderedMap.iterator ##########
-  class iterator:
-    """Encapsulation of a position in the map"""
-    def __init__(self, node):
-      self._nd = node
+        if walk.parent is None:
+            self._root = child
+        else:
+            if walk is walk.parent.left:
+                walk.parent.left = child
+            else:
+                walk.parent.right = child
+        walk.parent = walk.left = walk.right = None   # disconnect, to be safe
 
-    def __repr__(self):
-      return "Iterator[key="+repr(self.key())+' value='+repr(self.value())+"]"
+    ###################################################
+    ######### nested class _OrderedMap._node ##########
+    class _node:
+        __slots__ = ('key', 'val', 'parent', 'left',
+                     'right', 'priority')   # optimization
 
-    def __eq__(self, other):
-      """Return True if iterators represent the same position."""
-      return self._nd == other._nd
+        """Simple struct to represent node of the treap"""
 
-    def __ne__(self, other):
-      """Return True if iterators do not represent the same position."""
-      return not self._nd == other._nd
+        def __init__(self, key, value=None, parent=None, leftChild=None, rightChild=None):
+            self.key = key
+            self.val = value
+            self.parent = parent
+            self.left = leftChild
+            self.right = rightChild
+            self.priority = _ourRandom.random()
 
-    def key(self):
-      """Return key of element at this position."""
-      return self._nd.key
+        def subtreeMin(self):
+            """Return leftmost node of subtree."""
+            walk = self
+            while walk.left is not None:
+                walk = walk.left
+            return walk
 
-    def value(self):
-      """Return value of element at this position."""
-      return self._nd.val
+        def subtreeMax(self):
+            """Return rightmost node of subtree."""
+            walk = self
+            while walk.right is not None:
+                walk = walk.right
+            return walk
 
-    def prev(self):
-      """Return iterator to the previous element of the map.
-         Return None if there is no predecessor."""
-      other = self._nd.predecessor()
-      if other is not None:
-        return _OrderedMap.iterator(other)
-      else:
-        return None
+        def predecessor(self):
+            """Returns node of predecessor.  Returns None if this is minimum."""
+            if self.left is not None:
+                return self.left.subtreeMax()
+            else:
+                walk = self
+                while walk.parent is not None and walk.parent.left is walk:
+                    walk = walk.parent
+                return walk.parent
 
-    def next(self):
-      """Return iterator to the next element of the map.
-         Return None if there is no successor."""
-      other = self._nd.successor()
-      if other is not None:
-        return _OrderedMap.iterator(other)
-      else:
-        return None
+        def successor(self):
+            """Returns node of successor.  Returns None if this is maximum."""
+            if self.right is not None:
+                return self.right.subtreeMin()
+            else:
+                walk = self
+                while walk.parent is not None and walk.parent.right is walk:
+                    walk = walk.parent
+                return walk.parent
 
-  ######### end of class _OrderedMap.iterator ##########
+    ######### end of class _OrderedMap._node ##########
+
+    ######################################################
+    ######### nested class _OrderedMap.iterator ##########
+    class iterator:
+
+        """Encapsulation of a position in the map"""
+
+        def __init__(self, node):
+            self._nd = node
+
+        def __repr__(self):
+            return "Iterator[key=" + repr(self.key()) + ' value=' + repr(self.value()) + "]"
+
+        def __eq__(self, other):
+            """Return True if iterators represent the same position."""
+            return self._nd == other._nd
+
+        def __ne__(self, other):
+            """Return True if iterators do not represent the same position."""
+            return not self._nd == other._nd
+
+        def key(self):
+            """Return key of element at this position."""
+            return self._nd.key
+
+        def value(self):
+            """Return value of element at this position."""
+            return self._nd.val
+
+        def prev(self):
+            """Return iterator to the previous element of the map.
+               Return None if there is no predecessor."""
+            other = self._nd.predecessor()
+            if other is not None:
+                return _OrderedMap.iterator(other)
+            else:
+                return None
+
+        def next(self):
+            """Return iterator to the next element of the map.
+               Return None if there is no successor."""
+            other = self._nd.successor()
+            if other is not None:
+                return _OrderedMap.iterator(other)
+            else:
+                return None
+
+    ######### end of class _OrderedMap.iterator ##########
 
 
 class _Hierarchy:
+
     """Used to maintain minimal information to track which objects are
     currently contained (directly or indirectly) on a Canvas, and to
     track the parent/child relationships between those objects.
@@ -608,13 +707,14 @@ class _Hierarchy:
     Button._draw call, but two subsequent due to the underlying
     Rectangle._draw and Text._draw calls.
     """
-    
+
     def __init__(self):
         self._objects = {}       # map from obj to set of all (obj,cls) pairs
-        self._relationships = {} # map from (obj.cls) pair to [parentSet, childrenDict, maxSerial]
-                                 # where parentSet is set of (obj,cls) tuples,
-                                 # childrenDict is dictionary mapping from (child,cls) -> serialFloat,
-                                 # and maxSerial is an upper bound on the serials currently in use
+        # map from (obj.cls) pair to [parentSet, childrenDict, maxSerial]
+        self._relationships = {}
+        # where parentSet is set of (obj,cls) tuples,
+        # childrenDict is dictionary mapping from (child,cls) -> serialFloat,
+        # and maxSerial is an upper bound on the serials currently in use
 
     def __contains__(self, drawable):
         """Determines whether the drawable is contained in the current hierarchy."""
@@ -623,8 +723,8 @@ class _Hierarchy:
     def newCanvas(self, canvas):
         """Adds canvas as new top-level container in the hierarchy."""
         self._objects[canvas] = set()
-        self._objects[canvas].add( (canvas,Canvas) )
-        self._relationships[ (canvas, Canvas) ] = [set(), {}, 0]
+        self._objects[canvas].add((canvas, Canvas))
+        self._relationships[(canvas, Canvas)] = [set(), {}, 0]
 
     def addLink(self, parentTuple, childTuple):
         """Connect child to parent.
@@ -636,7 +736,8 @@ class _Hierarchy:
         relate = self._relationships[parentTuple]
         relate[2] += 1   # update serial
         relate[1][childTuple] = relate[2]    # new child with updated serial
-        self._relationships.setdefault(childTuple, [set(), {}, 0])[0].add(parentTuple)
+        self._relationships.setdefault(childTuple, [set(), {}, 0])[
+            0].add(parentTuple)
 
     def removeLink(self, parentTuple, childTuple):
         """Removes the child from the parent (including the cleansing of any descendents)."""
@@ -647,7 +748,7 @@ class _Hierarchy:
         # remove parent from child's list of parents
         childsParents = self._relationships[childTuple][0]
         childsParents.remove(parentTuple)
-        if not childsParents:                        # empty set
+        if not childsParents:  # empty set
             self._recursiveRemove(childTuple)
 
     def findChildTuple(self, parentTuple, child):
@@ -674,7 +775,7 @@ class _Hierarchy:
         for c in children.keys():
             childsParents = self._relationships[c][0]
             childsParents.remove(objTuple)
-            if not childsParents:    # no more parents
+            if not childsParents:  # no more parents
                 self._recursiveRemove(c)
 
     def reviseChildren(self, drawTuple, childSequence):
@@ -682,29 +783,30 @@ class _Hierarchy:
 
         Returns list of (child,serial) pairs for those children that require updated serial numbers.
         """
-        raise NotImplementedError('reviseChildren not yet written')   # TODO
+        raise NotImplementedError('reviseChildren not yet written')  # TODO
 
-    def computeUpwardChains(self, drawable, counts = None):
+    def computeUpwardChains(self, drawable, counts=None):
         if counts is None:
             counts = {}
         if isinstance(drawable, tuple):
-            tuples = [ drawable ]
+            tuples = [drawable]
         else:
             tuples = self._objects[drawable]
-        
+
         results = []
         for t in tuples:
-            self._computeUpwardChainsRecurse(results,t,counts)
-            
-        if _debug >= 2:
-            print('ComputeUpwardChains('+str(drawable)+','+str(counts)+') returning:')
+            self._computeUpwardChainsRecurse(results, t, counts)
+
+        if _DEBUG['Middle'] >= 2:
+            print('ComputeUpwardChains(' + str(drawable) +
+                  ',' + str(counts) + ') returning:')
             for c in results:
-                print('    '+str(tuple(c)))
+                print('    ' + str(tuple(c)))
 
         return results
 
     def _computeUpwardChainsRecurse(self, results, drawTuple, count):
-        prevCount = count.get(drawTuple,0)
+        prevCount = count.get(drawTuple, 0)
         if prevCount < _RECURSIVE_LIMIT:
             parents = self._relationships[drawTuple][0]
             if parents:
@@ -714,12 +816,12 @@ class _Hierarchy:
                     self._computeUpwardChainsRecurse(results, p, count)
                     for k in range(oldSize, len(results)):
                         results[k].append(drawTuple)
-                count[drawTuple] -= 1       # decrement count, to avoid side effects
+                count[drawTuple] -= 1  # decrement count, to avoid side effects
                 if count[drawTuple] == 0:
                     del count[drawTuple]
             else:
-                results.append( [drawTuple] )    # "drawTuple" must represent a canvas
-
+                # "drawTuple" must represent a canvas
+                results.append([drawTuple])
 
     def computeDownwardChains(self, drawTuple):
         """Computes all downward chians from the given starting point.
@@ -730,10 +832,10 @@ class _Hierarchy:
         """
         results = []
         self._computeDownwardChainsRecurse(results, drawTuple, {})
-        if _debug >= 2:
-            print('ComputeDownwardChains('+str(drawTuple)+') returning:')
+        if _DEBUG['Middle'] >= 2:
+            print('ComputeDownwardChains(' + str(drawTuple) + ') returning:')
             for c in results:
-                print('    '+str(tuple(c)))
+                print('    ' + str(tuple(c)))
         return results
 
     def _computeDownwardChainsRecurse(self, results, drawTuple, count):
@@ -755,7 +857,7 @@ class _Hierarchy:
         """
         prevCount = count.get(drawTuple, 0)
         count[drawTuple] = 1 + prevCount
-        results.append( ([drawTuple], dict(count)) )
+        results.append(([drawTuple], dict(count)))
         for child in self._relationships[drawTuple][1].keys():
             if count.get(child, 0) < _RECURSIVE_LIMIT:
                 oldSize = len(results)
@@ -766,8 +868,9 @@ class _Hierarchy:
         if count[drawTuple] == 0:
             del count[drawTuple]
 
-    
+
 class _RenderedHierarchy:
+
     class Node:
         __slots__ = ('_chain', '_children', '_sortedChildren', '_prev', '_next', '_parent',   # optimization
                      '_depth', '_transformation', '_cumulativeTransformation', '_renderedDrawable')
@@ -783,28 +886,35 @@ class _RenderedHierarchy:
             self._transformation = _Transformation()
             self._cumulativeTransformation = _Transformation()
             self._renderedDrawable = None
-    
+
     def __init__(self):
         self._root = self.Node()
         self._first = None
         self._last = None
         self._nodeLookup = dict()
         self._nodeLookup[tuple()] = self._root
-        
+
     def add(self, chain, depth, transformation, renderedDrawable):
         """Add a new chain to the hierarchy and return the new node.
-        
+
         The parent chain must be present.
         """
         parentChain = chain[:-1]
         parentNode = self._nodeLookup[parentChain]
-        
+
         # Create the new node
         newNode = self.Node()
         newNode._chain = chain
         newNode._depth = depth
         newNode._transformation = transformation
-        newNode._cumulativeTransformation = parentNode._cumulativeTransformation*transformation
+
+        if parentChain and parentChain[-1][0] is chain[-1][0] and parentChain[-1][1] is not chain[-1][1]:
+            # do not reapply local transform if parent call to _draw is reflected in the chain
+            # (recognized by same object ID, but with different class; this allows recursive layer)
+            newNode._cumulativeTransformation = parentNode._cumulativeTransformation * _Transformation()
+        else:
+            # standard case
+            newNode._cumulativeTransformation = parentNode._cumulativeTransformation * transformation
         newNode._renderedDrawable = renderedDrawable
         newNode._parent = parentNode
 
@@ -814,13 +924,13 @@ class _RenderedHierarchy:
         parentNode._sortedChildren[depth] = newNode
         self._addThreads(newNode, parentNode)
         return newNode
-    
+
     def remove(self, chain):
         """Remove a node and all of its children.
-        
+
         A list of RenderedDrawables to be deleted is returned.
         """
-        node = self._nodeLookup[chain]        
+        node = self._nodeLookup[chain]
         parentChain = chain[:-1]
         parentNode = self._nodeLookup[parentChain]
 
@@ -828,59 +938,61 @@ class _RenderedHierarchy:
         parentNode._children.pop(chain[-1])
         del parentNode._sortedChildren[node._depth]
         self._removeThreads(node, parentNode)
-            
+
         # Find all of the RenderedDrawables to delete
         deleted = list()
         queue = [node]
         while len(queue) > 0:
             n = queue.pop()
             self._nodeLookup.pop(n._chain)
-            
+
             if n._renderedDrawable is not None:
                 deleted.append(n._renderedDrawable)
             queue.extend(n._children.values())
-        
+
         return deleted
-    
+
     def prev(self, node):
         """Find the previous leaf node.
-        
+
         Precondition:    node is a leaf node
         If there is no previous node it returns None
         """
         return node._prev
-    
+
     def next(self, node):
         """Find the next leaf node.
-        
+
         Precondition:    node is a leaf node
         If there is no next node it returns None
         """
         return node._next
-    
+
     def first(self, node):
         while len(node._sortedChildren) > 0:
             node = node._sortedChildren.first().value()
         return node
-    
+
     def last(self, node):
         while len(node._sortedChildren) > 0:
             node = node._sortedChildren.last().value()
         return node
-    
+
     def getNode(self, chain):
         return self._nodeLookup[chain]
-        
+
     def hasChain(self, chain):
         return chain in self._nodeLookup
-    
+
     def getDepth(self, chain):
         return self._nodeLookup[chain]._depth
 
     def changeDepth(self, chain, newDepth):
         node = self._nodeLookup[chain]
         oldDepth = node._depth
-        if _debug >= 1.5:  print('change depth of ' + str(chain) + ' from ' + str(oldDepth) + ' to ' + str(newDepth))
+        if _DEBUG['RenderedH'] >= 1.5:
+            print('change depth of ' + str(chain) + ' from ' +
+                  str(oldDepth) + ' to ' + str(newDepth))
         node._depth = newDepth
         parent = node._parent
         handle = parent._sortedChildren.find(oldDepth)
@@ -891,28 +1003,40 @@ class _RenderedHierarchy:
         if (prevSib is not None and newDepth < prevSib.key()) or \
            (nextSib is not None and newDepth > nextSib.key()):
             # must re-thread relative to siblings
-            if _debug >= 2.5:
-                for (k,v) in iter(parent._sortedChildren):
-                    print( '  child: ' + str(k) + ' ' + str(v))
+            if _DEBUG['RenderedH'] >= 2.5:
+                for (k, v) in iter(parent._sortedChildren):
+                    print('  child: ' + str(k) + ' ' + str(v))
             self._removeThreads(node, parent)   # detach from old location
             self._addThreads(node, parent)      # reattach in new location
-            return (self.first(node), self.last(node)) # Return range of things that need to be changed
+            # Return range of things that need to be changed
+            return (self.first(node), self.last(node))
         else:
             return (None, None)
-    
+
     def changeTransform(self, chain, newTransform):
         node = self._nodeLookup[chain]
         node._transformation = newTransform
-        node._cumulativeTransformation = node._parent._cumulativeTransformation * newTransform
-        
+        if len(chain) > 1 and chain[-2][0] is chain[-1][0] and chain[-2][1] is not chain[-1][1]:
+            # do not reapply change if parent call to _draw is reflected in the chain
+            node._cumulativeTransformation = node._parent._cumulativeTransformation * _Transformation()
+        else:
+            node._cumulativeTransformation = node._parent._cumulativeTransformation * newTransform
+
         # Propogate to children
         toFix = list(node._children.values())
         while len(toFix) > 0:
             n = toFix.pop()
-            n._cumulativeTransformation = n._parent._cumulativeTransformation * n._transformation
+            childTuple = n._chain[-1]
+            parentTuple = n._parent._chain[-1]
+            if childTuple[0] is parentTuple[0] and childTuple[1] is not parentTuple[1]:
+                # do not reapply change if parent call to _draw is reflected in the chain
+                n._cumulativeTransformation = n._parent._cumulativeTransformation * _Transformation()
+            else:
+                n._cumulativeTransformation = n._parent._cumulativeTransformation * n._transformation
             toFix.extend(n._children.values())
-            
-        return (self.first(node), self.last(node))    # Return range of things that need to be changed
+
+        # Return range of things that need to be changed
+        return (self.first(node), self.last(node))
 
     def _addThreads(self, newNode, parentNode):
         """Adjust the threads to incorporate a recently added node/subtree."""
@@ -938,9 +1062,10 @@ class _RenderedHierarchy:
                 last._next = self._first
             else:
                 neighbor = p._sortedChildren.find(c._depth)
-                first._prev = self.last(p._sortedChildren.find(c._depth).prev().value())
+                first._prev = self.last(
+                    p._sortedChildren.find(c._depth).prev().value())
                 last._next = first._prev._next
-        
+
         # establish links from rest back to new tree
         if first._prev is None:
             self._first = first
@@ -950,7 +1075,7 @@ class _RenderedHierarchy:
             self._last = last
         else:
             last._next._prev = last
-        
+
     def _removeThreads(self, node, parentNode):
         """Adjust the threads to disengage a node/subtree that is being moved/removed."""
         # Fix threading
@@ -976,9 +1101,10 @@ class _RenderedHierarchy:
                 self._last = first._prev
             else:
                 last._next._prev = first._prev
-            
-    
+
+
 class _UpdateManager:
+
     """This is a structure to manage pending updates until they are
     ready to be passed on to the _RenderedManager.
 
@@ -988,8 +1114,9 @@ class _UpdateManager:
     prefix-free of each other, although they may share a commond prefix.
     """
 
-    #------------------- inner _node class -----------------
+    # ------------------- inner _node class -----------------
     class _node:
+
         """A basic inner class for a node in the tree.
 
         status will be maintained either as 'stable', 'remove', or 'add'
@@ -1013,12 +1140,13 @@ class _UpdateManager:
         def __init__(self, chain):
             """New node is presume 'stable' unless informed subsequently"""
             self._chain = chain
-            self._publicChildren = _OrderedMap()
+            self._publicChildren = _OrderedMap(_chainCompare)
             self._privateChildren = None
             self._publicUpdates = {}
             self._privateUpdates = None
             self._status = 'stable'        # the default
-            self._special = ''             # used for special cases with propogating private/public branches
+            # used for special cases with propogating private/public branches
+            self._special = ''
 
         def isFrozen(self):
             """Is this node representing a directly frozen element.
@@ -1047,7 +1175,7 @@ class _UpdateManager:
             # that unfreeze is propogated later.
             if self._special != 'remove':
                 self._special = 'unfreeze'      # remove trumps unfreeze
-            
+
             if self.isFrozen():
                 self._publicUpdates.update(self._privateUpdates)
                 self._privateUpdates = None
@@ -1068,12 +1196,13 @@ class _UpdateManager:
             # occurred or that remove/add pairs took place, since
             # those events should cause changes to the state of the
             # public branch.
-            if _debug >= 2:
+            if _DEBUG['UpdateManager'] >= 2:
                 print("Within _resolveMirror on node " + str(self))
-            
+
             for (chain, child) in list(privateMap):
-                if _debug >= 3:
-                    print("Resolving child " + str(child) + " with status " + child._status + " and special " + child._special)
+                if _DEBUG['UpdateManager'] >= 3:
+                    print("Resolving child " + str(child) + " with status " +
+                          child._status + " and special " + child._special)
                 if child._special == 'remove':      # anything else here was after the remove
                     self._updateRecurse(chain, 'remove', {}, privateMap)
                     if child._status == 'stable':    # must have been re-added subsequently
@@ -1086,15 +1215,18 @@ class _UpdateManager:
                 elif child._publicUpdates:
                     self._updateRecurse(chain, 'update', child._publicUpdates)
                 if child._publicChildren:
-                    self._resolveMirror(child._publicChildren)   # recurse, with updates sent to this node
+                    # recurse, with updates sent to this node
+                    self._resolveMirror(child._publicChildren)
 
                 if child.isFrozen():
                     self._updateRecurse(chain, 'freeze')
                     if child._privateUpdates:
-                        self._updateRecurse(chain, 'update', child._privateUpdates)
+                        self._updateRecurse(
+                            chain, 'update', child._privateUpdates)
                     if child._privateChildren:
-                        self._resolveMirror(child._privateChildren)   # recurse, with updates sent to this node
-            
+                        # recurse, with updates sent to this node
+                        self._resolveMirror(child._privateChildren)
+
         def setProperties(self, properties):
             """Properties can be any dictionary of kev/value pairs.
 
@@ -1136,7 +1268,8 @@ class _UpdateManager:
                 # cannot kill yet, since rendering already exists.
                 # But we can clear all pending properties/updates and
                 # effectively unfreze.
-                self._status = self._special = 'remove'        # note well that we set _special as well
+                # note well that we set _special as well
+                self._status = self._special = 'remove'
                 self._publicUpdates = {}
                 self._publicChildren = _OrderedMap()
                 self._privateUpdates = None
@@ -1144,10 +1277,12 @@ class _UpdateManager:
 
         def _updateRecurse(self, chain, style, properties={}, parentMap=None):
             """Note that parentMap need only be sent when style is 'remove'."""
-            if _debug >= 3:
-                print('_UpdateManager._node._updateRecurse called with\n    ' + '\n    '.join([str(x) for x in (self,chain,style,properties)]))
-                print('  Node is currently ' + ('frozen' if self.isFrozen() else 'unfrozen'))
-    
+            if _DEBUG['Middle'] >= 3:
+                print('_UpdateManager._node._updateRecurse called with\n    ' +
+                      '\n    '.join([str(x) for x in (self, chain, style, properties)]))
+                print('  Node is currently ' +
+                      ('frozen' if self.isFrozen() else 'unfrozen'))
+
             if self._chain == chain:
                 # exact match;  make the changes
                 if style == 'remove':
@@ -1182,42 +1317,49 @@ class _UpdateManager:
                 # check for other children that should be contained under
                 # new child, then recurse (on what will be base case)
                 child = _UpdateManager._node(chain)
-                if _debug >= 2.5:
-                    print("created new _UpdateManager._node: " + str(child) + " for chain " + str(chain))
+                if _DEBUG['Middle'] >= 2.5:
+                    print("created new _UpdateManager._node: " +
+                          str(child) + " for chain " + str(chain))
                 while after is not None and after.key()[:len(chain)] == chain:
                     relocate = after
                     after = relocate.next()
-                    child._publicChildren[relocate.key()] = relocate.value()  # reinsert under new node (always public)
-                    children.remove(relocate)                                 # and remove from current level
-                children[chain] = child                                       # add child
+                    # reinsert under new node (always public)
+                    child._publicChildren[relocate.key()] = relocate.value()
+                    # and remove from current level
+                    children.remove(relocate)
+                # add child
+                children[chain] = child
                 child._updateRecurse(chain, style, properties, children)
 
         def _flushRecurse(self, parentMap=None):
-          if _debug >= 3:
-              print('_flushRecurse called on node ' + str(self))
-              print('isFrozen currently' + str(self.isFrozen()))
-    
-          if self._status != 'stable' or len(self._publicUpdates) > 0:
-              # this node needs to be added/removed or has properties to push
-              yield (self._chain, self._status, self._publicUpdates)
-              self._publicUpdates = {}
-              self._status = 'stable'
-    
-          # consider all public children, even if current node is frozen
-          for (key,c) in list(self._publicChildren):              # use copy, since calls may mutate
-              for result in c._flushRecurse(self._publicChildren):
-                  yield result
-    
-          if parentMap is not None and not self.isFrozen():
-              # this node has no private data, and all public updates will have been pushed
-              # only issue is remaining (frozen) children.  Let's destroy this node, and promote
-              # any remaining children in its place.
-              for (_,c) in self._publicChildren:
-                  parentMap[c._chain] = c            # move this node's remaining children to parent
-              del parentMap[self._chain]             # and then remove this node, since flushed
-     
-    #------------------- end of inner _node class -----------------
-                
+            if _DEBUG['Middle'] >= 3:
+                print('_flushRecurse called on node ' + str(self))
+                print('isFrozen currently ' + str(self.isFrozen()))
+
+            if self._status != 'stable' or len(self._publicUpdates) > 0:
+                # this node needs to be added/removed or has properties to push
+                yield (self._chain, self._status, self._publicUpdates)
+                self._publicUpdates = {}
+                self._status = 'stable'
+
+            # consider all public children, even if current node is frozen
+            for (key, c) in list(self._publicChildren):              # use copy, since calls may mutate
+                for result in c._flushRecurse(self._publicChildren):
+                    #print ('   OH HYE, HERE IS THE RESULT ' + str(result))
+                    #print ('\n\n\n')
+                    yield result
+
+            if parentMap is not None and not self.isFrozen():
+                # this node has no private data, and all public updates will have been pushed
+                # only issue is remaining (frozen) children.  Let's destroy this node, and promote
+                # any remaining children in its place.
+                for (_, c) in self._publicChildren:
+                    # move this node's remaining children to parent
+                    parentMap[c._chain] = c
+                # and then remove this node, since flushed
+                del parentMap[self._chain]
+
+    # ------------------- end of inner _node class -----------------
 
     def __init__(self):
         """An initially empty Hierarchy.
@@ -1235,18 +1377,20 @@ class _UpdateManager:
         For 'add' or 'update', properties should be dictionary of key/value pairs.
         Empty dicitonary should be used for remove/freeze/unfreeze.
         """
-        if _debug >= 1:
-            print('\n_UpdateManager.update called with\n    ' + '\n    '.join([str(x) for x in (chain,style,properties)]))
+        if _DEBUG['Middle'] >= 1:
+            print('\n_UpdateManager.update called with\n    ' +
+                  '\n    '.join([str(x) for x in (chain, style, properties)]))
             if not isinstance(style, basestring):
                 raise TypeError('style should be a string')
             if style not in ('add', 'remove', 'freeze', 'unfreeze', 'update'):
-                raise ValueError('invalud style designator: ' + str(statusFlags))
+                raise ValueError(
+                    'invalid style designator: ' + str(statusFlags))
             if not isinstance(properties, dict):
                 raise TypeError('properties should be a dictionary')
             if style in ('remove', 'freeze', 'unfreeze') and len(properties) > 0:
                 raise ValueError('Must send empty dictionary with ' + style)
-        self._root._updateRecurse(chain, style, properties, self._root._publicChildren)
-
+        self._root._updateRecurse(
+            chain, style, properties, self._root._publicChildren)
 
     def flush(self):
         """This returns a preorder generator of all updates to be rendered.
@@ -1258,21 +1402,23 @@ class _UpdateManager:
         Objects yielded are (chain, status, properties)
         where status is 'add', 'remove', or 'stable' and properties is a dictionary
         """
-        if _debug >= 1:
+        if _DEBUG['Middle'] >= 1:
             print('_UpdateManager.flush() called')
         return self._root._flushRecurse()
 
 
 class _GraphicsManager:
+
     def __init__(self):
         # Synchornization mechanisms
-        self._state = 'Initial'                 # 'Initial', 'Running', 'Stopped' or 'Failed'
+        # 'Initial', 'Running', 'Stopped' or 'Failed'
+        self._state = 'Initial'
         self._commandQueue = _Queue.Queue()
-        self._commandLock = _threading.RLock()  # Must be grabbed before working with command queue
-        
+        # Must be grabbed before working with command queue
+        self._commandLock = _threading.RLock()
+
         self._resultQueue = _Queue.Queue()
         self._functionLock = _threading.RLock()
-
 
         # Rendering engine objects
 
@@ -1305,20 +1451,21 @@ class _GraphicsManager:
         self._openCanvases = []
         self._drawParent = None
         self._drawChildren = None
-        
+
         # Event handling
         # _handlingEvents could be Always, Yes, No or Waiting
         if _nativeThreading:
-          self._handlingEvents = 'Always'
+            self._handlingEvents = 'Always'
         else:
-          self._handlingEvents = 'No'
+            self._handlingEvents = 'No'
         self._waitingObject = None
         self._eventQueue = _Queue.Queue()
         self._eventHandlers = dict()
+        self._periodicHandlers = dict()
         self._objectIdRegistry = dict()
         self._lastEvent = None
         self._eventLock = _threading.RLock()   # TODO lock every event thing up
-            
+
         # Mouse
         self._mousePrevPosition = None
         self._mouseButtonDown = False
@@ -1327,12 +1474,15 @@ class _GraphicsManager:
         self._commandLock.acquire()
 
     def completeRefresh(self, pushUpdates=True):
-        # TODO:  in single-threaded, wait until LAST reentrant lock released before pushing
+        # In single-threaded, wait until LAST reentrant lock released before pushing
+
         if pushUpdates:
-          self.addCommandToQueue(('push updates',))
-          if not _nativeThreading:
-              self.processCommands()
-              _tkroot.update()
+            self.addCommandToQueue(('push updates',))
+            if not _nativeThreading:
+                # Loop to check if queue is empty
+                while not self._commandQueue.empty():
+                    self.processCommands()
+                    _tkroot.update()
         self._commandLock.release()
 
     def addCommandToQueue(self, command):
@@ -1347,14 +1497,19 @@ class _GraphicsManager:
                 _atexit.register(_exitMainThread)
 
         if self._state != 'Failed':
-          if _debug >= 1:
-              print('addCommandToQueue: ' + str(command))
-          self._commandQueue.put(command)
+            if _DEBUG['Front'] >= 1:
+                print('addCommandToQueue: ' + str(command) +
+                      ' from thread ' + repr(_threading.currentThread()))
+            self._commandQueue.put(command)
 
     def _closeAll(self):
-        pass # TODO
+        for canvas in self._openCanvases:
+            canvas.close()
 
     def processCommands(self):
+        if _DEBUG['processCommands'] >= 1 and not _nativeThreading:
+            print('\n')
+            print('processCommands called\n')
         MAX_TIME = 0.1
         start_time = _time.time()
         try:
@@ -1369,28 +1524,30 @@ class _GraphicsManager:
         except GraphicsError:
             raise
         except:     # TODO: too general?
-                # Note: could happen for an empty queue
-                print('Unknown graphics error has occured.  Graphics manager is shutting down.')
-                print('Program must be restarted to use graphics.')
-                print('If problem is repeatable, please report to bugs@cs1graphics.org.')
-                self._state = 'Failed'
-                self._closeAll()
-                if _debug > 0:    # exit upon first error
-                    _traceback.print_exc(file=_sys.stdout)
-                    _sys.exit()
+            # Note: could happen for an empty queue
+            print(
+                'Unknown graphics error has occured.  Graphics manager is shutting down.')
+            print('Program must be restarted to use graphics.')
+            print('If problem is repeatable, please report to bugs@cs1graphics.org.')
+            self._state = 'Failed'
+            self._closeAll()
+            if max(_DEBUG.values()) > 0:    # exit upon first error
+                _traceback.print_exc(file=_sys.stdout)
+                _sys.exit()
 
     def serializeDepth(self, original, parentTuple, leafTuple):
-        serial = -self._middleHierarchy.getSerial(parentTuple, leafTuple)  # negated to get painter's ordering
-        if isinstance(parentTuple[0], (Canvas,Layer)):
+        # negated to get painter's ordering
+        serial = -self._middleHierarchy.getSerial(parentTuple, leafTuple)
+        if isinstance(parentTuple[0], (Canvas, Layer)):
             depthKey = (original, serial)
         else:                                             # user-defined
             depthKey = (None, serial)
         return depthKey
 
     def processCommand(self, command):
-        if _debug >= 1:
-            print('')
-            print('Manager executing: ' + str(command))
+        if _DEBUG['processCommands'] >= 1:
+            print('Manager executing: ' + str(command) +
+                  ' from thread ' + repr(_threading.currentThread()))
 
         # Rendering
         if command[0] == 'push updates':
@@ -1398,12 +1555,12 @@ class _GraphicsManager:
 
         # Canvases
         elif command[0] == 'create canvas':
-            chain = ((command[1],Canvas),)
+            chain = ((command[1], Canvas),)
             self._updateManager.update(chain, 'add', command[2])
             self._middleHierarchy.newCanvas(command[1])
             if command[2]['frozen']:
                 self._updateManager.update(chain, 'freeze')
-                
+
         elif command[0] == 'close canvas':
             _tkroot.update()
 
@@ -1421,72 +1578,87 @@ class _GraphicsManager:
         elif command[0] == 'object added':
             containerTuple = command[1]
             drawableTuple = command[2]
-            if _debug >= 1:
-                print('_middleHierarchy.addLink: ' + str(containerTuple) + ' ' + str(drawableTuple))
+            if _DEBUG['processCommands'] >= 1:
+                print('_middleHierarchy.addLink: ' +
+                      str(containerTuple) + ' ' + str(drawableTuple))
             self._middleHierarchy.addLink(containerTuple, drawableTuple)
 
-            downwardChains = self._middleHierarchy.computeDownwardChains(drawableTuple)
-            for d,count in downwardChains:
+            downwardChains = self._middleHierarchy.computeDownwardChains(
+                drawableTuple)
+            for d, count in downwardChains:
                 leafTuple = d[-1]
-                properties = dict(self._middleProperties[leafTuple[0]])   # intentional copy
+                # intentional copy
+                properties = dict(self._middleProperties[leafTuple[0]])
                 isFrozen = properties['frozen']
                 if len(d) > 1:
                     # we know the parent for all such chains
                     parentTuple = d[-2]
                 else:
                     parentTuple = containerTuple
-                properties['depth'] = self.serializeDepth(properties['depth'], parentTuple, leafTuple)
+                properties['depth'] = self.serializeDepth(
+                    properties['depth'], parentTuple, leafTuple)
 
                 for u in self._middleHierarchy.computeUpwardChains(containerTuple, count):
-                    tc = tuple(u + d) 
+                    tc = tuple(u + d)
 
-                    if _debug >= 1.5:
+                    if _DEBUG['Middle'] >= 1.5:
                         print('\nAdding chain to updateManager: ' + repr(tc))
                         print("Effective depth " + str(properties['depth']))
 
-                    self._updateManager.update(tc, 'add', properties)   
+                    self._updateManager.update(tc, 'add', properties)
                     if isFrozen:
                         self._updateManager(tc, 'freeze')
-                        
+
         elif command[0] == 'object removed':
             parent = command[1]
             child = command[2]
             for c in self._middleHierarchy.computeUpwardChains(parent):
-                c.append( child )
+                c.append(child)
                 self._updateManager.update(tuple(c), 'remove')
-            if _debug >= 1:
-                print('_middleHierarchy.removeLink: ' + str(parent) + ' ' + str(child))
-            self._middleHierarchy.removeLink(parent,child)
-            
+            if _DEBUG['processCommands'] >= 1:
+                print('_middleHierarchy.removeLink: ' +
+                      str(parent) + ' ' + str(child))
+            self._middleHierarchy.removeLink(parent, child)
+
         # Drawables
         elif command[0] == 'update':
-            self._middleProperties.setdefault(command[1],{}).update(command[2])
+            #print (    'The following is command[1] ' + str(command[1]))
+            #print (    'The following is command[2] ' + str(command[2]))
+            self._middleProperties.setdefault(
+                command[1], {}).update(command[2])
             if command[1] in self._middleHierarchy:
                 for chain in self._middleHierarchy.computeUpwardChains(command[1]):
                     if 'depth' in command[2]:
                         parentTuple = chain[-2]
                         childTuple = chain[-1]
-                        command[2]['depth'] = self.serializeDepth(command[2]['depth'], parentTuple, childTuple)
-                        if _debug >= 1:
-                            print('Updating Effective Depth: %s' % str(command[2]['depth']))
-                    self._updateManager.update(tuple(chain), 'update', command[2])
-                
+                        command[2]['depth'] = self.serializeDepth(
+                            command[2]['depth'], parentTuple, childTuple)
+                        if _DEBUG['processCommands'] >= 1:
+                            print('Updating Effective Depth: %s' %
+                                  str(command[2]['depth']))
+                    self._updateManager.update(
+                        tuple(chain), 'update', command[2])
+
         elif command[0] == 'load image':
-            s = command[1]
             good = True
-            i = None
+
             try:
-                if s[:7] != "base64:":
+                if not _pilAvailable:
                     i = _Tkinter.PhotoImage(file=command[1])
                 else:
-                    data = _base64.b64decode(s[7:])
-                    r = _cStringIO.StringIO(data)
-                    i = _ImageTk.PhotoImage(_Image.open(r).convert('RGBA'))
+                    if command[1].startswith('base64:'):
+                        data = _base64.b64decode(command[1][len('base64:'):])
+                        img = _Image.open(_Base64IO(data)).convert('RGBA')
+                    else:
+                        img = _Image.open(command[1]).convert('RGBA')
+                    i = _ImageTk.PhotoImage(img)
+            except _Tkinter.TclError:
+                good = False
             except:
                 good = False
 
             if good:
-                self._resultQueue.put( (i, i.width(), i.height()) )
+                self._resultQueue.put((i, i.width(), i.height()))
             else:
                 self._resultQueue.put(None)
 
@@ -1497,58 +1669,81 @@ class _GraphicsManager:
             self._resultQueue.put(_getTextSize(command[1], command[2]))
 
         elif command[0] == 'save to file':
-            rc = self._renderedHierarchy.getNode( ((command[1],Canvas),) )._renderedDrawable
+            rc = self._renderedHierarchy.getNode(
+                ((command[1], Canvas),))._renderedDrawable
             rc.saveToFile(command[2], command[3])
+            self._resultQueue.put(None)
+
+        elif command[0] == 'save to io':
+            rc = self._renderedHierarchy.getNode(
+                ((command[1], Canvas),))._renderedDrawable
+            rc.saveToIO(command[2], command[3])
             self._resultQueue.put(None)
 
     def _pushUpdates(self):
         # Loop through update manager, adjust the rendered hierarchy and rendering
-        if _debug >= 1:
+        if _DEBUG['Middle'] >= 1:
             print("_pushUpdates called")
         for (chain, status, properties) in self._updateManager.flush():
-            if _debug >= 1:
-                print('_pushUpdates: ' + str(status)+' '+str(chain)+' '+str(properties))
+            if _DEBUG['Middle'] >= 2:
+                print('_pushUpdates: ' + str(status) + ' ' +
+                      str(chain) + ' ' + str(properties))
                 if self._renderedHierarchy.hasChain(chain):
-                    print('    Rendered Depth is ' + str(self._renderedHierarchy.getNode(chain)._depth))
+                    print('    Rendered Depth is ' +
+                          str(self._renderedHierarchy.getNode(chain)._depth))
 
             if status == 'add':
                 assert not self._renderedHierarchy.hasChain(chain)
-                current = self._renderedHierarchy.add(chain, properties['depth'], properties['transformation'], None)
-                current._renderedDrawable = self._createRendered(chain, properties)
+                current = self._renderedHierarchy.add(
+                    chain, properties['depth'], properties['transformation'], None)
+                current._renderedDrawable = self._createRendered(
+                    chain, properties)
                 if not isinstance(current._renderedDrawable, _RenderedCanvas) and current._renderedDrawable is not None:
                     node = current._next
                     while node is not None and node._renderedDrawable is None:
                         node = node._next
-                    if node is not None and node._chain[0] == chain[0]:  # TODO: correct treatment of forest???
-                        if _debug >= 1: print('Putting '+str(current._renderedDrawable)+' above '+str(node._renderedDrawable))
-                        current._renderedDrawable.putAbove(node._renderedDrawable)
+                    # TODO: correct treatment of forest???
+                    if node is not None and node._chain[0] == chain[0]:
+                        if _DEBUG['Middle'] >= 1:
+                            print('Putting ' + str(current._renderedDrawable) +
+                                  ' above ' + str(node._renderedDrawable))
+                        current._renderedDrawable.putAbove(
+                            node._renderedDrawable)
                     else:
-                        if _debug >= 1: print('Putting '+str(current._renderedDrawable)+' at bottom')
+                        if _DEBUG['Middle'] >= 1:
+                            print(
+                                'Putting ' + str(current._renderedDrawable) + ' at bottom')
                         current._renderedDrawable.putAbove(None)
 
             elif status == 'remove':
                 removed = self._renderedHierarchy.remove(chain)
                 for renderedDrawable in removed:
-                  renderedDrawable.remove()
+                    renderedDrawable.remove()
 
             elif status == 'stable':
                 # Update transformation
                 if 'transformation' in properties:
-                    (first, last) = self._renderedHierarchy.changeTransform(chain, properties['transformation'])
+                    (first, last) = self._renderedHierarchy.changeTransform(
+                        chain, properties['transformation'])
                     current = first
                     while True:
                         if current._renderedDrawable is not None:
-                            current._renderedDrawable.update({'transformation': current._transformation})
+                            current._renderedDrawable.update(
+                                {'transformation': current._transformation})
                         if current == last:
                             break
                         current = current._next
-                    del properties['transformation']  # will not need to update this below
+                    # will not need to update this below
+                    del properties['transformation']
 
                 # Update depth
                 if 'depth' in properties:
-                    (first, last) = self._renderedHierarchy.changeDepth(chain, properties['depth'])
+                    (first, last) = self._renderedHierarchy.changeDepth(
+                        chain, properties['depth'])
                     if first is not None:   # something changed
-                        if _debug >= 1.5: print('first, last = '+str( (first._renderedDrawable,last._renderedDrawable) ))
+                        if _DEBUG['Middle'] >= 2:
+                            print(
+                                'first, last = ' + str((first._renderedDrawable, last._renderedDrawable)))
 
                         # first goal is finding an adequate anchor below this group
                         below = last._next
@@ -1559,45 +1754,49 @@ class _GraphicsManager:
                         current = last
                         while current != first._prev:
                             if current._renderedDrawable is not None:
-                                if below is not None:
-                                    if _debug >= 1.5:
-                                        print('Putting '+str(current._renderedDrawable)+' above '+str(below._renderedDrawable))
-                                    current._renderedDrawable.putAbove(below._renderedDrawable)
+                                if below is not None and below._chain[0] == chain[0]:
+                                    if _DEBUG['Middle'] >= 1:
+                                        print('Putting ' + str(current._renderedDrawable) +
+                                              ' above ' + str(below._renderedDrawable))
+                                    current._renderedDrawable.putAbove(
+                                        below._renderedDrawable)
                                 else:
-                                    if _debug >= 1.5:
-                                        print('Putting ' + str(current._renderedDrawable) +  ' at bottom')
+                                    if _DEBUG['Middle'] >= 1:
+                                        print(
+                                            'Putting ' + str(current._renderedDrawable) + ' at bottom')
                                     current._renderedDrawable.putAbove(None)
                                 below = current
                             current = current._prev
 
                 # Update any other properties (beyond transformation, depth)
                 if properties:
-                    rd = self._renderedHierarchy.getNode(chain)._renderedDrawable
+                    rd = self._renderedHierarchy.getNode(
+                        chain)._renderedDrawable
                     if rd is not None:
                         rd.update(properties)
 
     def _createRendered(self, chain, properties):
-        subchain = chain[-1][0]
-        if isinstance(subchain, Canvas):
-            return _RenderedCanvas(chain, properties)
-        elif isinstance(subchain, Circle):
-            return _RenderedCircle(chain, properties)
-        elif isinstance(subchain, Ellipse):
-            return _RenderedCircle(chain, properties)          # note well: using _renderedCircle
-        elif isinstance(subchain, Rectangle):                # note well: Square qualifies
-            return _RenderedRectangle(chain, properties)
+        mapping = {
+            Canvas: _RenderedCanvas,
+            Circle: _RenderedCircle,
+            Ellipse: _RenderedCircle,       # note well: using _renderedCircle
+            Rectangle: _RenderedRectangle,
+            Polygon: _RenderedPolygon,
+            Path: _RenderedPath,
+            Text: _RenderedText,
+            Image: _RenderedImage,
+        }
 
-        # For next pair of cases, we test for more specific Polygon before Path.
-        # Also, note that we render ClosedSpline as a Polygon and Spline as a Path
-        elif isinstance(subchain, Polygon):
-            return _RenderedPolygon(chain, properties)
-        elif isinstance(subchain, Path):
-            return _RenderedPath(chain, properties)
+        goal = chain[-1][1]
+        rendered = mapping.get(goal)
+        if _DEBUG['Tkinter'] >= 2:
+            print('_createRendered called on chain' +
+                  str(chain) + ' using ' + str(rendered))
 
-        elif isinstance(subchain, Text):
-            return _RenderedText(chain, properties)
-        elif isinstance(subchain, Image):
-            return _RenderedImage(chain, properties)
+        if rendered is not None:
+            return rendered(chain, properties)   # create new instance
+        else:
+            return None                          # nothing to render
 
     def executeFunction(self, command):
         # Perform a single command and return a value
@@ -1612,32 +1811,54 @@ class _GraphicsManager:
         result = self._resultQueue.get()
         self._functionLock.release()
         return result
-        
+
     def addEventToQueue(self, handler, event):
         if self._handlingEvents == 'Always':
             # Start a new thread and go
-            pass # TODO
+            # What's to be expected is reasonable, call the
+            handler.handle(event)
         elif self._handlingEvents == 'Yes':
-            self._eventQueue.put((handler,event))
+            self._eventQueue.put((handler, event))
         elif self._handlingEvents == 'Waiting' and event._trigger == self._waitingObject:
-            self._eventQueue.put((handler,event))
+            self._eventQueue.put((handler, event))
         else:
-            pass # Ignore the event
-            
+            pass  # Ignore the event
+
     def addHandler(self, obj, handler):
-        #handlers = self._eventHandlers.get(obj, set())       
-        #handlers.add(handler)
+        #handlers = self._eventHandlers.get(obj, set())
+        # handlers.add(handler)
         #self._eventHandlers[obj] = handlers
         self._eventHandlers.setdefault(obj, set()).add(handler)
-            
+        #print ('  Event Handler for ' + str(obj) + ' ' + str(self._eventHandlers[obj]))
+
     def removeHandler(self, obj, handler):
         s = self._eventHandlers.get(obj, set())
         if handler in s:
-            s.remove(handler)  # 
+            s.remove(handler)  #
         else:
             raise ValueError()
-            
+
+    def addPeriodicHandler(self, obj, interval, handler, immediately=True, repeat=True):
+        self._periodicHandlers.setdefault(obj, set()).add(handler)
+
+        def _periodicHandlerWrapper():
+            handler(obj)
+            if repeat and handler in self._periodicHandlers.get(obj, set()):
+                _tkroot.after(interval, _periodicHandlerWrapper)
+
+        if immediately:
+            _periodicHandlerWrapper()
+        else:
+            _tkroot.after(interval, _periodicHandlerWrapper)
+
+    def removePeriodicHandler(self, interval, handler):
+        s = self._periodicHandlers.get(obj, set())
+        if handler in s:
+            s.remove(handler)
+
     def processEvents(self):
+        if _DEBUG['processEvents'] >= 5:
+            print('Entering process events\n')
         while not self._eventQueue.empty():
             (handler, event) = self._eventQueue.get(False)
             self._lastEvent = event
@@ -1646,42 +1867,65 @@ class _GraphicsManager:
             while not self._eventQueue.empty():
                 self._eventQueue.get(False)
             handler.handle(event)
-        
+
     def wait(self, waiter):
+        if _DEBUG['wait'] >= 1:
+            print('_handlingEvents = ' + self._handlingEvents)
+            print('  The following is the currentThread in wait')
+            print(_threading.currentThread())
         if self._handlingEvents == 'Always':
             lock = _threading.Lock()
             rh = _ReleaseHandler(lock)
+            self.addHandler(waiter, rh)
+            lock.acquire()
+            self.removeHandler(waiter, rh)
             return rh._event
         elif self._handlingEvents == 'No':
+            if _DEBUG['wait'] >= 1:
+                print('addHandler is called')
             self.addHandler(waiter, EventHandler())
             self.mainLoop(waiter, True)
             return self._lastEvent
-        
+
     def mainLoop(self, waiting=None, exitOnAllClosed=True):
         if waiting:
+            # handlingEvents is set to waiting to prevent loop
+            if _DEBUG['mainLoop'] >= 3:
+                print('_handlingEvents is currently: ') + self._handlingEvents
             self._handlingEvents = 'Waiting'
-            self._waitingObject = waiting         
-        
+            if _DEBUG['mainLoop'] >= 2:
+                print('   waiting is the following ')
+                print(waiting)
+                print('\n')
+            # waitingObject is updated to be waiting (canvas then circle)
+            self._waitingObject = waiting
+        # Might want to note states, when they could change, same for _handlingEvents
+        # A sort of state transition guide
         while self._state == 'Running' and self._handlingEvents in ('Yes', 'Waiting'):
+            if _DEBUG['mainLoop'] >= 4:
+                print('About to call _tkroot.update()')
             _tkroot.update()
+            if _DEBUG['mainLoop'] >= 4:
+                print('Finished call _tkroot.update()')
             self.processEvents()
             if exitOnAllClosed and len(_graphicsManager._openCanvases) == 0:
                 break
             _time.sleep(.1)
-     
-      
+
 
 # Events Primatives
 class Event(object):
+
     """An event typically triggered by the user interface."""
+
     def __init__(self):
         self._eventType = ''
         self._x, self._y = 0, 0
-        self._prevx, self._prevy = 0,0
+        self._prevx, self._prevy = 0, 0
         self._key = ''
         self._button = None
         self._trigger = None
-    
+
     def getDescription(self):
         """Return a text description of the event.
 
@@ -1689,19 +1933,19 @@ class Event(object):
           'mouse click', 'mouse release', 'mouse drag', 'keyboard, 'timer', 'canvas close'
         """
         return self._eventType
-    
+
     def getMouseLocation(self):
         """Return a Point designating the location of the mouse at the time of the event."""
         return Point(self._x, self._y)
-    
+
     def getOldMouseLocation(self):
         """Return a Point designating the location of the mouse at the start of a mouse drag."""
         return Point(self._prevx, self._prevy)
-  
+
     def getTrigger(self):
         """Return a reference to the object that triggered the event."""
         return self._trigger
-  
+
     def getKey(self):
         """Return a string designating the key pressed for a keyboard event."""
         return self._key
@@ -1710,27 +1954,32 @@ class Event(object):
         """Return number of the mouse button that caused the mouse event (else None)."""
         return self._button
 
+
 class EventHandler(object):
+
     """A base class for creating new event handlers.
 
     The handle method for this base class does not do anything.
     """
+
     def __init__(self):
         """Create a new event handler.
-        
+
         Children of this class must call this constructor.
         """
         pass
 
     def handle(self, event):
         """Handle an event.
-        
+
         Child classes must override this method, but do not need
         to call it.
         """
         pass
 
+
 class _ReleaseHandler(EventHandler):
+
     def __init__(self, lock):
         self._lock = lock
         self._event = None
@@ -1741,10 +1990,11 @@ class _ReleaseHandler(EventHandler):
             self._event = event
             self._lock.release()
 
+
 class _EventTrigger(object):
 
     def __init__(self):
-        pass
+        super(_EventTrigger, self).__init__()
 
     def wait(self):
         """Wait for an event to occur.
@@ -1757,33 +2007,43 @@ class _EventTrigger(object):
     def addHandler(self, handler):
         """Register an EventHandler instance with this object."""
         if not isinstance(handler, EventHandler):
-            raise TypeError('Only instance of EventHandler (or child class) can handle events')
+            raise TypeError(
+                'Only instance of EventHandler (or child class) can handle events')
         try:
-            _graphicsManager.addHandler(self, handler)  # TODO should be a on queue, not thread safe
+            # TODO should be a on queue, not thread safe
+            _graphicsManager.addHandler(self, handler)
         except ValueError:
-            raise ValueError('Handler is already handling events for this object')
+            raise ValueError(
+                'Handler is already handling events for this object')
 
     def removeHandler(self, handler):
         """Unregister an EventHandler instance from this object."""
         if not isinstance(handler, EventHandler):
-            raise TypeError('Parameter is not an instance of EventHandler (or child class)')
+            raise TypeError(
+                'Parameter is not an instance of EventHandler (or child class)')
         try:
-            _graphicsManager.removeHandler(self, handler)  # TODO should be a on queue, not thread safe
+            # TODO should be a on queue, not thread safe
+            _graphicsManager.removeHandler(self, handler)
         except ValueError:
-            raise ValueError('The handler is not currently associated with this object.')
+            raise ValueError(
+                'The handler is not currently associated with this object.')
 
-    
+
 class _EventThread(_threading.Thread):
+
     def __init__(self, handler, event):
-        _threading.Thread.__init__(self)
+        super(_EventThread, self).__init__()
         self._handler = handler
         self._event = event
-    
+
     def run(self):
         self._handler.handle(self._event)
 
 # Graphics Primatives
+
+
 class Point(object):
+
     """Stores a two-dimensional point using Cartesian coordinates."""
 
     def __init__(self, initialX=0, initialY=0):
@@ -1847,9 +2107,9 @@ class Point(object):
         If the point currently represents the origin, it is unchanged.
 
         """
-        mag = self.distance( Point() )
+        mag = self.distance(Point())
         if mag > 0:
-            self.scale(1./mag)
+            self.scale(1. / mag)
 
     def __str__(self):
         """Return a string representation of the point (e.g., '<0,0>')."""
@@ -1906,13 +2166,14 @@ class Point(object):
         """
         if not isinstance(angle, (int, float)):
             raise TypeError('angle must be a number')
-        angle = _math.pi*angle/180.
+        angle = _math.pi * angle / 180.
         return Point(self._x * _math.cos(angle) - self._y * _math.sin(angle),
                      self._x * _math.sin(angle) + self._y * _math.cos(angle))
 
+
 class _Transformation(object):
     EPSILON = 0.0000001            # arbitrary
-    
+
     def __init__(self, value=None):
         if value:
             self._matrix = tuple(value[:4])
@@ -1921,28 +2182,30 @@ class _Transformation(object):
             self._matrix = (1., 0., 0., 1.)
             self._translation = (0., 0.)
 
-    def  __str__(self):
+    def __str__(self):
         return repr(self._matrix)[:-1] + '; ' + repr(self._translation)[1:]
 
     def image(self, point):
-        return Point(self._matrix[0]*point._x + self._matrix[1]*point._y + self._translation[0],
-                     self._matrix[2]*point._x + self._matrix[3]*point._y + self._translation[1])
+        return Point(self._matrix[0] * point._x + self._matrix[1] * point._y + self._translation[0],
+                     self._matrix[2] * point._x + self._matrix[3] * point._y + self._translation[1])
 
     def inv(self):
         detinv = 1. / self.det()
-        m = ( self._matrix[3] * detinv, -self._matrix[1] * detinv,
-              -self._matrix[2] * detinv, self._matrix[0] * detinv )
-        t = ( -m[0]*self._translation[0] - m[1]*self._translation[1],
-              -m[2]*self._translation[0] - m[3]*self._translation[1])
-        return _Transformation(m+t)
+        m = (self._matrix[3] * detinv, -self._matrix[1] * detinv,
+             -self._matrix[2] * detinv, self._matrix[0] * detinv)
+        t = (-m[0] * self._translation[0] - m[1] * self._translation[1],
+             -m[2] * self._translation[0] - m[3] * self._translation[1])
+        return _Transformation(m + t)
 
     def __mul__(self, other):
         m = (self._matrix[0] * other._matrix[0] + self._matrix[1] * other._matrix[2],
-             self._matrix[0] * other._matrix[1] + self._matrix[1] * other._matrix[3],
-             self._matrix[2] * other._matrix[0] + self._matrix[3] * other._matrix[2],
+             self._matrix[0] * other._matrix[1] +
+             self._matrix[1] * other._matrix[3],
+             self._matrix[2] * other._matrix[0] +
+             self._matrix[3] * other._matrix[2],
              self._matrix[2] * other._matrix[1] + self._matrix[3] * other._matrix[3])
 
-        p = self.image( Point(other._translation[0], other._translation[1]) )
+        p = self.image(Point(other._translation[0], other._translation[1]))
 
         return _Transformation(m + (p.getX(), p.getY()))
 
@@ -1968,6 +2231,7 @@ class _Transformation(object):
                 abs(self._matrix[0] - 1) <= _Transformation.EPSILON and
                 abs(self._matrix[3] - 1) <= _Transformation.EPSILON)
 
+
 class Color(object):
 
     """A color representation.
@@ -1980,336 +2244,336 @@ class Color(object):
     """
 
     _colorValues = {
-        'aliceblue'            : (240,248,255), 'antiquewhite'         : (250,235,215),
-        'antiquewhite1'        : (255,239,219), 'antiquewhite2'        : (238,223,204),
-        'antiquewhite3'        : (205,192,176), 'antiquewhite4'        : (139,131,120),
-        'aquamarine'           : (127,255,212), 'aquamarine1'          : (127,255,212),
-        'aquamarine2'          : (118,238,198), 'aquamarine3'          : (102,205,170),
-        'aquamarine4'          : ( 69,139,116), 'azure'                : (240,255,255),
-        'azure1'               : (240,255,255), 'azure2'               : (224,238,238),
-        'azure3'               : (193,205,205), 'azure4'               : (131,139,139),
-        'beige'                : (245,245,220), 'bisque'               : (255,228,196),
-        'bisque1'              : (255,228,196), 'bisque2'              : (238,213,183),
-        'bisque3'              : (205,183,158), 'bisque4'              : (139,125,107),
-        'black'                : (  0,  0,  0), 'blanchedalmond'       : (255,235,205),
-        'blue'                 : (  0,  0,255), 'blue1'                : (  0,  0,255),
-        'blue2'                : (  0,  0,238), 'blue3'                : (  0,  0,205),
-        'blue4'                : (  0,  0,139), 'blueviolet'           : (138, 43,226),
-        'brown'                : (165, 42, 42), 'brown1'               : (255, 64, 64),
-        'brown2'               : (238, 59, 59), 'brown3'               : (205, 51, 51),
-        'brown4'               : (139, 35, 35), 'burlywood'            : (222,184,135),
-        'burlywood1'           : (255,211,155), 'burlywood2'           : (238,197,145),
-        'burlywood3'           : (205,170,125), 'burlywood4'           : (139,115, 85),
-        'cadetblue'            : ( 95,158,160), 'cadetblue1'           : (152,245,255),
-        'cadetblue2'           : (142,229,238), 'cadetblue3'           : (122,197,205),
-        'cadetblue4'           : ( 83,134,139), 'chartreuse'           : (127,255,  0),
-        'chartreuse1'          : (127,255,  0), 'chartreuse2'          : (118,238,  0),
-        'chartreuse3'          : (102,205,  0), 'chartreuse4'          : ( 69,139,  0),
-        'chocolate'            : (210,105, 30), 'chocolate1'           : (255,127, 36),
-        'chocolate2'           : (238,118, 33), 'chocolate3'           : (205,102, 29),
-        'chocolate4'           : (139, 69, 19), 'coral'                : (255,127, 80),
-        'coral1'               : (255,114, 86), 'coral2'               : (238,106, 80),
-        'coral3'               : (205, 91, 69), 'coral4'               : (139, 62, 47),
-        'cornflowerblue'       : (100,149,237), 'cornsilk'             : (255,248,220),
-        'cornsilk1'            : (255,248,220), 'cornsilk2'            : (238,232,205),
-        'cornsilk3'            : (205,200,177), 'cornsilk4'            : (139,136,120),
-        'cyan'                 : (  0,255,255), 'cyan1'                : (  0,255,255),
-        'cyan2'                : (  0,238,238), 'cyan3'                : (  0,205,205),
-        'cyan4'                : (  0,139,139), 'darkblue'             : (  0,  0,139),
-        'darkcyan'             : (  0,139,139), 'darkgoldenrod'        : (184,134, 11),
-        'darkgoldenrod1'       : (255,185, 15), 'darkgoldenrod2'       : (238,173, 14),
-        'darkgoldenrod3'       : (205,149, 12), 'darkgoldenrod4'       : (139,101,  8),
-        'darkgray'             : (169,169,169), 'darkgreen'            : (  0,100,  0),
-        'darkgrey'             : (169,169,169), 'darkkhaki'            : (189,183,107),
-        'darkmagenta'          : (139,  0,139), 'darkolivegreen'       : ( 85,107, 47),
-        'darkolivegreen1'      : (202,255,112), 'darkolivegreen2'      : (188,238,104),
-        'darkolivegreen3'      : (162,205, 90), 'darkolivegreen4'      : (110,139, 61),
-        'darkorange'           : (255,140,  0), 'darkorange1'          : (255,127,  0),
-        'darkorange2'          : (238,118,  0), 'darkorange3'          : (205,102,  0),
-        'darkorange4'          : (139, 69,  0), 'darkorchid'           : (153, 50,204),
-        'darkorchid1'          : (191, 62,255), 'darkorchid2'          : (178, 58,238),
-        'darkorchid3'          : (154, 50,205), 'darkorchid4'          : (104, 34,139),
-        'darkred'              : (139,  0,  0), 'darksalmon'           : (233,150,122),
-        'darkseagreen'         : (143,188,143), 'darkseagreen1'        : (193,255,193),
-        'darkseagreen2'        : (180,238,180), 'darkseagreen3'        : (155,205,155),
-        'darkseagreen4'        : (105,139,105), 'darkslateblue'        : ( 72, 61,139),
-        'darkslategray'        : ( 47, 79, 79), 'darkslategray1'       : (151,255,255),
-        'darkslategray2'       : (141,238,238), 'darkslategray3'       : (121,205,205),
-        'darkslategray4'       : ( 82,139,139), 'darkslategrey'        : ( 47, 79, 79),
-        'darkturquoise'        : (  0,206,209), 'darkviolet'           : (148,  0,211),
-        'deeppink'             : (255, 20,147), 'deeppink1'            : (255, 20,147),
-        'deeppink2'            : (238, 18,137), 'deeppink3'            : (205, 16,118),
-        'deeppink4'            : (139, 10, 80), 'deepskyblue'          : (  0,191,255),
-        'deepskyblue1'         : (  0,191,255), 'deepskyblue2'         : (  0,178,238),
-        'deepskyblue3'         : (  0,154,205), 'deepskyblue4'         : (  0,104,139),
-        'dimgray'              : (105,105,105), 'dimgrey'              : (105,105,105),
-        'dodgerblue'           : ( 30,144,255), 'dodgerblue1'          : ( 30,144,255),
-        'dodgerblue2'          : ( 28,134,238), 'dodgerblue3'          : ( 24,116,205),
-        'dodgerblue4'          : ( 16, 78,139), 'firebrick'            : (178, 34, 34),
-        'firebrick1'           : (255, 48, 48), 'firebrick2'           : (238, 44, 44),
-        'firebrick3'           : (205, 38, 38), 'firebrick4'           : (139, 26, 26),
-        'floralwhite'          : (255,250,240), 'forestgreen'          : ( 34,139, 34),
-        'gainsboro'            : (220,220,220), 'ghostwhite'           : (248,248,255),
-        'gold'                 : (255,215,  0), 'gold1'                : (255,215,  0),
-        'gold2'                : (238,201,  0), 'gold3'                : (205,173,  0),
-        'gold4'                : (139,117,  0), 'goldenrod'            : (218,165, 32),
-        'goldenrod1'           : (255,193, 37), 'goldenrod2'           : (238,180, 34),
-        'goldenrod3'           : (205,155, 29), 'goldenrod4'           : (139,105, 20),
-        'gray'                 : (190,190,190), 'gray0'                : (  0,  0,  0),
-        'gray1'                : (  3,  3,  3), 'gray10'               : ( 26, 26, 26),
-        'gray100'              : (255,255,255), 'gray11'               : ( 28, 28, 28),
-        'gray12'               : ( 31, 31, 31), 'gray13'               : ( 33, 33, 33),
-        'gray14'               : ( 36, 36, 36), 'gray15'               : ( 38, 38, 38),
-        'gray16'               : ( 41, 41, 41), 'gray17'               : ( 43, 43, 43),
-        'gray18'               : ( 46, 46, 46), 'gray19'               : ( 48, 48, 48),
-        'gray2'                : (  5,  5,  5), 'gray20'               : ( 51, 51, 51),
-        'gray21'               : ( 54, 54, 54), 'gray22'               : ( 56, 56, 56),
-        'gray23'               : ( 59, 59, 59), 'gray24'               : ( 61, 61, 61),
-        'gray25'               : ( 64, 64, 64), 'gray26'               : ( 66, 66, 66),
-        'gray27'               : ( 69, 69, 69), 'gray28'               : ( 71, 71, 71),
-        'gray29'               : ( 74, 74, 74), 'gray3'                : (  8,  8,  8),
-        'gray30'               : ( 77, 77, 77), 'gray31'               : ( 79, 79, 79),
-        'gray32'               : ( 82, 82, 82), 'gray33'               : ( 84, 84, 84),
-        'gray34'               : ( 87, 87, 87), 'gray35'               : ( 89, 89, 89),
-        'gray36'               : ( 92, 92, 92), 'gray37'               : ( 94, 94, 94),
-        'gray38'               : ( 97, 97, 97), 'gray39'               : ( 99, 99, 99),
-        'gray4'                : ( 10, 10, 10), 'gray40'               : (102,102,102),
-        'gray41'               : (105,105,105), 'gray42'               : (107,107,107),
-        'gray43'               : (110,110,110), 'gray44'               : (112,112,112),
-        'gray45'               : (115,115,115), 'gray46'               : (117,117,117),
-        'gray47'               : (120,120,120), 'gray48'               : (122,122,122),
-        'gray49'               : (125,125,125), 'gray5'                : ( 13, 13, 13),
-        'gray50'               : (127,127,127), 'gray51'               : (130,130,130),
-        'gray52'               : (133,133,133), 'gray53'               : (135,135,135),
-        'gray54'               : (138,138,138), 'gray55'               : (140,140,140),
-        'gray56'               : (143,143,143), 'gray57'               : (145,145,145),
-        'gray58'               : (148,148,148), 'gray59'               : (150,150,150),
-        'gray6'                : ( 15, 15, 15), 'gray60'               : (153,153,153),
-        'gray61'               : (156,156,156), 'gray62'               : (158,158,158),
-        'gray63'               : (161,161,161), 'gray64'               : (163,163,163),
-        'gray65'               : (166,166,166), 'gray66'               : (168,168,168),
-        'gray67'               : (171,171,171), 'gray68'               : (173,173,173),
-        'gray69'               : (176,176,176), 'gray7'                : ( 18, 18, 18),
-        'gray70'               : (179,179,179), 'gray71'               : (181,181,181),
-        'gray72'               : (184,184,184), 'gray73'               : (186,186,186),
-        'gray74'               : (189,189,189), 'gray75'               : (191,191,191),
-        'gray76'               : (194,194,194), 'gray77'               : (196,196,196),
-        'gray78'               : (199,199,199), 'gray79'               : (201,201,201),
-        'gray8'                : ( 20, 20, 20), 'gray80'               : (204,204,204),
-        'gray81'               : (207,207,207), 'gray82'               : (209,209,209),
-        'gray83'               : (212,212,212), 'gray84'               : (214,214,214),
-        'gray85'               : (217,217,217), 'gray86'               : (219,219,219),
-        'gray87'               : (222,222,222), 'gray88'               : (224,224,224),
-        'gray89'               : (227,227,227), 'gray9'                : ( 23, 23, 23),
-        'gray90'               : (229,229,229), 'gray91'               : (232,232,232),
-        'gray92'               : (235,235,235), 'gray93'               : (237,237,237),
-        'gray94'               : (240,240,240), 'gray95'               : (242,242,242),
-        'gray96'               : (245,245,245), 'gray97'               : (247,247,247),
-        'gray98'               : (250,250,250), 'gray99'               : (252,252,252),
-        'green'                : (  0,255,  0), 'green1'               : (  0,255,  0),
-        'green2'               : (  0,238,  0), 'green3'               : (  0,205,  0),
-        'green4'               : (  0,139,  0), 'greenyellow'          : (173,255, 47),
-        'grey'                 : (190,190,190), 'grey0'                : (  0,  0,  0),
-        'grey1'                : (  3,  3,  3), 'grey10'               : ( 26, 26, 26),
-        'grey100'              : (255,255,255), 'grey11'               : ( 28, 28, 28),
-        'grey12'               : ( 31, 31, 31), 'grey13'               : ( 33, 33, 33),
-        'grey14'               : ( 36, 36, 36), 'grey15'               : ( 38, 38, 38),
-        'grey16'               : ( 41, 41, 41), 'grey17'               : ( 43, 43, 43),
-        'grey18'               : ( 46, 46, 46), 'grey19'               : ( 48, 48, 48),
-        'grey2'                : (  5,  5,  5), 'grey20'               : ( 51, 51, 51),
-        'grey21'               : ( 54, 54, 54), 'grey22'               : ( 56, 56, 56),
-        'grey23'               : ( 59, 59, 59), 'grey24'               : ( 61, 61, 61),
-        'grey25'               : ( 64, 64, 64), 'grey26'               : ( 66, 66, 66),
-        'grey27'               : ( 69, 69, 69), 'grey28'               : ( 71, 71, 71),
-        'grey29'               : ( 74, 74, 74), 'grey3'                : (  8,  8,  8),
-        'grey30'               : ( 77, 77, 77), 'grey31'               : ( 79, 79, 79),
-        'grey32'               : ( 82, 82, 82), 'grey33'               : ( 84, 84, 84),
-        'grey34'               : ( 87, 87, 87), 'grey35'               : ( 89, 89, 89),
-        'grey36'               : ( 92, 92, 92), 'grey37'               : ( 94, 94, 94),
-        'grey38'               : ( 97, 97, 97), 'grey39'               : ( 99, 99, 99),
-        'grey4'                : ( 10, 10, 10), 'grey40'               : (102,102,102),
-        'grey41'               : (105,105,105), 'grey42'               : (107,107,107),
-        'grey43'               : (110,110,110), 'grey44'               : (112,112,112),
-        'grey45'               : (115,115,115), 'grey46'               : (117,117,117),
-        'grey47'               : (120,120,120), 'grey48'               : (122,122,122),
-        'grey49'               : (125,125,125), 'grey5'                : ( 13, 13, 13),
-        'grey50'               : (127,127,127), 'grey51'               : (130,130,130),
-        'grey52'               : (133,133,133), 'grey53'               : (135,135,135),
-        'grey54'               : (138,138,138), 'grey55'               : (140,140,140),
-        'grey56'               : (143,143,143), 'grey57'               : (145,145,145),
-        'grey58'               : (148,148,148), 'grey59'               : (150,150,150),
-        'grey6'                : ( 15, 15, 15), 'grey60'               : (153,153,153),
-        'grey61'               : (156,156,156), 'grey62'               : (158,158,158),
-        'grey63'               : (161,161,161), 'grey64'               : (163,163,163),
-        'grey65'               : (166,166,166), 'grey66'               : (168,168,168),
-        'grey67'               : (171,171,171), 'grey68'               : (173,173,173),
-        'grey69'               : (176,176,176), 'grey7'                : ( 18, 18, 18),
-        'grey70'               : (179,179,179), 'grey71'               : (181,181,181),
-        'grey72'               : (184,184,184), 'grey73'               : (186,186,186),
-        'grey74'               : (189,189,189), 'grey75'               : (191,191,191),
-        'grey76'               : (194,194,194), 'grey77'               : (196,196,196),
-        'grey78'               : (199,199,199), 'grey79'               : (201,201,201),
-        'grey8'                : ( 20, 20, 20), 'grey80'               : (204,204,204),
-        'grey81'               : (207,207,207), 'grey82'               : (209,209,209),
-        'grey83'               : (212,212,212), 'grey84'               : (214,214,214),
-        'grey85'               : (217,217,217), 'grey86'               : (219,219,219),
-        'grey87'               : (222,222,222), 'grey88'               : (224,224,224),
-        'grey89'               : (227,227,227), 'grey9'                : ( 23, 23, 23),
-        'grey90'               : (229,229,229), 'grey91'               : (232,232,232),
-        'grey92'               : (235,235,235), 'grey93'               : (237,237,237),
-        'grey94'               : (240,240,240), 'grey95'               : (242,242,242),
-        'grey96'               : (245,245,245), 'grey97'               : (247,247,247),
-        'grey98'               : (250,250,250), 'grey99'               : (252,252,252),
-        'honeydew'             : (240,255,240), 'honeydew1'            : (240,255,240),
-        'honeydew2'            : (224,238,224), 'honeydew3'            : (193,205,193),
-        'honeydew4'            : (131,139,131), 'hotpink'              : (255,105,180),
-        'hotpink1'             : (255,110,180), 'hotpink2'             : (238,106,167),
-        'hotpink3'             : (205, 96,144), 'hotpink4'             : (139, 58, 98),
-        'indianred'            : (205, 92, 92), 'indianred1'           : (255,106,106),
-        'indianred2'           : (238, 99, 99), 'indianred3'           : (205, 85, 85),
-        'indianred4'           : (139, 58, 58), 'ivory'                : (255,255,240),
-        'ivory1'               : (255,255,240), 'ivory2'               : (238,238,224),
-        'ivory3'               : (205,205,193), 'ivory4'               : (139,139,131),
-        'khaki'                : (240,230,140), 'khaki1'               : (255,246,143),
-        'khaki2'               : (238,230,133), 'khaki3'               : (205,198,115),
-        'khaki4'               : (139,134, 78), 'lavender'             : (230,230,250),
-        'lavenderblush'        : (255,240,245), 'lavenderblush1'       : (255,240,245),
-        'lavenderblush2'       : (238,224,229), 'lavenderblush3'       : (205,193,197),
-        'lavenderblush4'       : (139,131,134), 'lawngreen'            : (124,252,  0),
-        'lemonchiffon'         : (255,250,205), 'lemonchiffon1'        : (255,250,205),
-        'lemonchiffon2'        : (238,233,191), 'lemonchiffon3'        : (205,201,165),
-        'lemonchiffon4'        : (139,137,112), 'lightblue'            : (173,216,230),
-        'lightblue1'           : (191,239,255), 'lightblue2'           : (178,223,238),
-        'lightblue3'           : (154,192,205), 'lightblue4'           : (104,131,139),
-        'lightcoral'           : (240,128,128), 'lightcyan'            : (224,255,255),
-        'lightcyan1'           : (224,255,255), 'lightcyan2'           : (209,238,238),
-        'lightcyan3'           : (180,205,205), 'lightcyan4'           : (122,139,139),
-        'lightgoldenrod'       : (238,221,130), 'lightgoldenrod1'      : (255,236,139),
-        'lightgoldenrod2'      : (238,220,130), 'lightgoldenrod3'      : (205,190,112),
-        'lightgoldenrod4'      : (139,129, 76), 'lightgoldenrodyellow' : (250,250,210),
-        'lightgray'            : (211,211,211), 'lightgreen'           : (144,238,144),
-        'lightgrey'            : (211,211,211), 'lightpink'            : (255,182,193),
-        'lightpink1'           : (255,174,185), 'lightpink2'           : (238,162,173),
-        'lightpink3'           : (205,140,149), 'lightpink4'           : (139, 95,101),
-        'lightsalmon'          : (255,160,122), 'lightsalmon1'         : (255,160,122),
-        'lightsalmon2'         : (238,149,114), 'lightsalmon3'         : (205,129, 98),
-        'lightsalmon4'         : (139, 87, 66), 'lightseagreen'        : ( 32,178,170),
-        'lightskyblue'         : (135,206,250), 'lightskyblue1'        : (176,226,255),
-        'lightskyblue2'        : (164,211,238), 'lightskyblue3'        : (141,182,205),
-        'lightskyblue4'        : ( 96,123,139), 'lightslateblue'       : (132,112,255),
-        'lightslategray'       : (119,136,153), 'lightslategrey'       : (119,136,153),
-        'lightsteelblue'       : (176,196,222), 'lightsteelblue1'      : (202,225,255),
-        'lightsteelblue2'      : (188,210,238), 'lightsteelblue3'      : (162,181,205),
-        'lightsteelblue4'      : (110,123,139), 'lightyellow'          : (255,255,224),
-        'lightyellow1'         : (255,255,224), 'lightyellow2'         : (238,238,209),
-        'lightyellow3'         : (205,205,180), 'lightyellow4'         : (139,139,122),
-        'limegreen'            : ( 50,205, 50), 'linen'                : (250,240,230),
-        'magenta'              : (255,  0,255), 'magenta1'             : (255,  0,255),
-        'magenta2'             : (238,  0,238), 'magenta3'             : (205,  0,205),
-        'magenta4'             : (139,  0,139), 'maroon'               : (176, 48, 96),
-        'maroon1'              : (255, 52,179), 'maroon2'              : (238, 48,167),
-        'maroon3'              : (205, 41,144), 'maroon4'              : (139, 28, 98),
-        'mediumaquamarine'     : (102,205,170), 'mediumblue'           : (  0,  0,205),
-        'mediumorchid'         : (186, 85,211), 'mediumorchid1'        : (224,102,255),
-        'mediumorchid2'        : (209, 95,238), 'mediumorchid3'        : (180, 82,205),
-        'mediumorchid4'        : (122, 55,139), 'mediumpurple'         : (147,112,219),
-        'mediumpurple1'        : (171,130,255), 'mediumpurple2'        : (159,121,238),
-        'mediumpurple3'        : (137,104,205), 'mediumpurple4'        : ( 93, 71,139),
-        'mediumseagreen'       : ( 60,179,113), 'mediumslateblue'      : (123,104,238),
-        'mediumspringgreen'    : (  0,250,154), 'mediumturquoise'      : ( 72,209,204),
-        'mediumvioletred'      : (199, 21,133), 'midnightblue'         : ( 25, 25,112),
-        'mintcream'            : (245,255,250), 'mistyrose'            : (255,228,225),
-        'mistyrose1'           : (255,228,225), 'mistyrose2'           : (238,213,210),
-        'mistyrose3'           : (205,183,181), 'mistyrose4'           : (139,125,123),
-        'moccasin'             : (255,228,181), 'navajowhite'          : (255,222,173),
-        'navajowhite1'         : (255,222,173), 'navajowhite2'         : (238,207,161),
-        'navajowhite3'         : (205,179,139), 'navajowhite4'         : (139,121, 94),
-        'navy'                 : (  0,  0,128), 'navyblue'             : (  0,  0,128),
-        'oldlace'              : (253,245,230), 'olivedrab'            : (107,142, 35),
-        'olivedrab1'           : (192,255, 62), 'olivedrab2'           : (179,238, 58),
-        'olivedrab3'           : (154,205, 50), 'olivedrab4'           : (105,139, 34),
-        'orange'               : (255,165,  0), 'orange1'              : (255,165,  0),
-        'orange2'              : (238,154,  0), 'orange3'              : (205,133,  0),
-        'orange4'              : (139, 90,  0), 'orangered'            : (255, 69,  0),
-        'orangered1'           : (255, 69,  0), 'orangered2'           : (238, 64,  0),
-        'orangered3'           : (205, 55,  0), 'orangered4'           : (139, 37,  0),
-        'orchid'               : (218,112,214), 'orchid1'              : (255,131,250),
-        'orchid2'              : (238,122,233), 'orchid3'              : (205,105,201),
-        'orchid4'              : (139, 71,137), 'palegoldenrod'        : (238,232,170),
-        'palegreen'            : (152,251,152), 'palegreen1'           : (154,255,154),
-        'palegreen2'           : (144,238,144), 'palegreen3'           : (124,205,124),
-        'palegreen4'           : ( 84,139, 84), 'paleturquoise'        : (175,238,238),
-        'paleturquoise1'       : (187,255,255), 'paleturquoise2'       : (174,238,238),
-        'paleturquoise3'       : (150,205,205), 'paleturquoise4'       : (102,139,139),
-        'palevioletred'        : (219,112,147), 'palevioletred1'       : (255,130,171),
-        'palevioletred2'       : (238,121,159), 'palevioletred3'       : (205,104,137),
-        'palevioletred4'       : (139, 71, 93), 'papayawhip'           : (255,239,213),
-        'peachpuff'            : (255,218,185), 'peachpuff1'           : (255,218,185),
-        'peachpuff2'           : (238,203,173), 'peachpuff3'           : (205,175,149),
-        'peachpuff4'           : (139,119,101), 'peru'                 : (205,133, 63),
-        'pink'                 : (255,192,203), 'pink1'                : (255,181,197),
-        'pink2'                : (238,169,184), 'pink3'                : (205,145,158),
-        'pink4'                : (139, 99,108), 'plum'                 : (221,160,221),
-        'plum1'                : (255,187,255), 'plum2'                : (238,174,238),
-        'plum3'                : (205,150,205), 'plum4'                : (139,102,139),
-        'powderblue'           : (176,224,230), 'purple'               : (160, 32,240),
-        'purple1'              : (155, 48,255), 'purple2'              : (145, 44,238),
-        'purple3'              : (125, 38,205), 'purple4'              : ( 85, 26,139),
-        'red'                  : (255,  0,  0), 'red1'                 : (255,  0,  0),
-        'red2'                 : (238,  0,  0), 'red3'                 : (205,  0,  0),
-        'red4'                 : (139,  0,  0), 'rosybrown'            : (188,143,143),
-        'rosybrown1'           : (255,193,193), 'rosybrown2'           : (238,180,180),
-        'rosybrown3'           : (205,155,155), 'rosybrown4'           : (139,105,105),
-        'royalblue'            : ( 65,105,225), 'royalblue1'           : ( 72,118,255),
-        'royalblue2'           : ( 67,110,238), 'royalblue3'           : ( 58, 95,205),
-        'royalblue4'           : ( 39, 64,139), 'saddlebrown'          : (139, 69, 19),
-        'salmon'               : (250,128,114), 'salmon1'              : (255,140,105),
-        'salmon2'              : (238,130, 98), 'salmon3'              : (205,112, 84),
-        'salmon4'              : (139, 76, 57), 'sandybrown'           : (244,164, 96),
-        'seagreen'             : ( 46,139, 87), 'seagreen1'            : ( 84,255,159),
-        'seagreen2'            : ( 78,238,148), 'seagreen3'            : ( 67,205,128),
-        'seagreen4'            : ( 46,139, 87), 'seashell'             : (255,245,238),
-        'seashell1'            : (255,245,238), 'seashell2'            : (238,229,222),
-        'seashell3'            : (205,197,191), 'seashell4'            : (139,134,130),
-        'sienna'               : (160, 82, 45), 'sienna1'              : (255,130, 71),
-        'sienna2'              : (238,121, 66), 'sienna3'              : (205,104, 57),
-        'sienna4'              : (139, 71, 38), 'skyblue'              : (135,206,235),
-        'skyblue1'             : (135,206,255), 'skyblue2'             : (126,192,238),
-        'skyblue3'             : (108,166,205), 'skyblue4'             : ( 74,112,139),
-        'slateblue'            : (106, 90,205), 'slateblue1'           : (131,111,255),
-        'slateblue2'           : (122,103,238), 'slateblue3'           : (105, 89,205),
-        'slateblue4'           : ( 71, 60,139), 'slategray'            : (112,128,144),
-        'slategray1'           : (198,226,255), 'slategray2'           : (185,211,238),
-        'slategray3'           : (159,182,205), 'slategray4'           : (108,123,139),
-        'slategrey'            : (112,128,144), 'snow'                 : (255,250,250),
-        'snow1'                : (255,250,250), 'snow2'                : (238,233,233),
-        'snow3'                : (205,201,201), 'snow4'                : (139,137,137),
-        'springgreen'          : (  0,255,127), 'springgreen1'         : (  0,255,127),
-        'springgreen2'         : (  0,238,118), 'springgreen3'         : (  0,205,102),
-        'springgreen4'         : (  0,139, 69), 'steelblue'            : ( 70,130,180),
-        'steelblue1'           : ( 99,184,255), 'steelblue2'           : ( 92,172,238),
-        'steelblue3'           : ( 79,148,205), 'steelblue4'           : ( 54,100,139),
-        'tan'                  : (210,180,140), 'tan1'                 : (255,165, 79),
-        'tan2'                 : (238,154, 73), 'tan3'                 : (205,133, 63),
-        'tan4'                 : (139, 90, 43), 'thistle'              : (216,191,216),
-        'thistle1'             : (255,225,255), 'thistle2'             : (238,210,238),
-        'thistle3'             : (205,181,205), 'thistle4'             : (139,123,139),
-        'tomato'               : (255, 99, 71), 'tomato1'              : (255, 99, 71),
-        'tomato2'              : (238, 92, 66), 'tomato3'              : (205, 79, 57),
-        'tomato4'              : (139, 54, 38), 'turquoise'            : ( 64,224,208),
-        'turquoise1'           : (  0,245,255), 'turquoise2'           : (  0,229,238),
-        'turquoise3'           : (  0,197,205), 'turquoise4'           : (  0,134,139),
-        'violet'               : (238,130,238), 'violetred'            : (208, 32,144),
-        'violetred1'           : (255, 62,150), 'violetred2'           : (238, 58,140),
-        'violetred3'           : (205, 50,120), 'violetred4'           : (139, 34, 82),
-        'wheat'                : (245,222,179), 'wheat1'               : (255,231,186),
-        'wheat2'               : (238,216,174), 'wheat3'               : (205,186,150),
-        'wheat4'               : (139,126,102), 'white'                : (255,255,255),
-        'whitesmoke'           : (245,245,245), 'yellow'               : (255,255,  0),
-        'yellow1'              : (255,255,  0), 'yellow2'              : (238,238,  0),
-        'yellow3'              : (205,205,  0), 'yellow4'              : (139,139,  0),
-        'yellowgreen'          : (154,205, 50),
-        }
+        'aliceblue': (240, 248, 255), 'antiquewhite': (250, 235, 215),
+        'antiquewhite1': (255, 239, 219), 'antiquewhite2': (238, 223, 204),
+        'antiquewhite3': (205, 192, 176), 'antiquewhite4': (139, 131, 120),
+        'aquamarine': (127, 255, 212), 'aquamarine1': (127, 255, 212),
+        'aquamarine2': (118, 238, 198), 'aquamarine3': (102, 205, 170),
+        'aquamarine4': (69, 139, 116), 'azure': (240, 255, 255),
+        'azure1': (240, 255, 255), 'azure2': (224, 238, 238),
+        'azure3': (193, 205, 205), 'azure4': (131, 139, 139),
+        'beige': (245, 245, 220), 'bisque': (255, 228, 196),
+        'bisque1': (255, 228, 196), 'bisque2': (238, 213, 183),
+        'bisque3': (205, 183, 158), 'bisque4': (139, 125, 107),
+        'black': (0,  0,  0), 'blanchedalmond': (255, 235, 205),
+        'blue': (0,  0, 255), 'blue1': (0,  0, 255),
+        'blue2': (0,  0, 238), 'blue3': (0,  0, 205),
+        'blue4': (0,  0, 139), 'blueviolet': (138, 43, 226),
+        'brown': (165, 42, 42), 'brown1': (255, 64, 64),
+        'brown2': (238, 59, 59), 'brown3': (205, 51, 51),
+        'brown4': (139, 35, 35), 'burlywood': (222, 184, 135),
+        'burlywood1': (255, 211, 155), 'burlywood2': (238, 197, 145),
+        'burlywood3': (205, 170, 125), 'burlywood4': (139, 115, 85),
+        'cadetblue': (95, 158, 160), 'cadetblue1': (152, 245, 255),
+        'cadetblue2': (142, 229, 238), 'cadetblue3': (122, 197, 205),
+        'cadetblue4': (83, 134, 139), 'chartreuse': (127, 255,  0),
+        'chartreuse1': (127, 255,  0), 'chartreuse2': (118, 238,  0),
+        'chartreuse3': (102, 205,  0), 'chartreuse4': (69, 139,  0),
+        'chocolate': (210, 105, 30), 'chocolate1': (255, 127, 36),
+        'chocolate2': (238, 118, 33), 'chocolate3': (205, 102, 29),
+        'chocolate4': (139, 69, 19), 'coral': (255, 127, 80),
+        'coral1': (255, 114, 86), 'coral2': (238, 106, 80),
+        'coral3': (205, 91, 69), 'coral4': (139, 62, 47),
+        'cornflowerblue': (100, 149, 237), 'cornsilk': (255, 248, 220),
+        'cornsilk1': (255, 248, 220), 'cornsilk2': (238, 232, 205),
+        'cornsilk3': (205, 200, 177), 'cornsilk4': (139, 136, 120),
+        'cyan': (0, 255, 255), 'cyan1': (0, 255, 255),
+        'cyan2': (0, 238, 238), 'cyan3': (0, 205, 205),
+        'cyan4': (0, 139, 139), 'darkblue': (0,  0, 139),
+        'darkcyan': (0, 139, 139), 'darkgoldenrod': (184, 134, 11),
+        'darkgoldenrod1': (255, 185, 15), 'darkgoldenrod2': (238, 173, 14),
+        'darkgoldenrod3': (205, 149, 12), 'darkgoldenrod4': (139, 101,  8),
+        'darkgray': (169, 169, 169), 'darkgreen': (0, 100,  0),
+        'darkgrey': (169, 169, 169), 'darkkhaki': (189, 183, 107),
+        'darkmagenta': (139,  0, 139), 'darkolivegreen': (85, 107, 47),
+        'darkolivegreen1': (202, 255, 112), 'darkolivegreen2': (188, 238, 104),
+        'darkolivegreen3': (162, 205, 90), 'darkolivegreen4': (110, 139, 61),
+        'darkorange': (255, 140,  0), 'darkorange1': (255, 127,  0),
+        'darkorange2': (238, 118,  0), 'darkorange3': (205, 102,  0),
+        'darkorange4': (139, 69,  0), 'darkorchid': (153, 50, 204),
+        'darkorchid1': (191, 62, 255), 'darkorchid2': (178, 58, 238),
+        'darkorchid3': (154, 50, 205), 'darkorchid4': (104, 34, 139),
+        'darkred': (139,  0,  0), 'darksalmon': (233, 150, 122),
+        'darkseagreen': (143, 188, 143), 'darkseagreen1': (193, 255, 193),
+        'darkseagreen2': (180, 238, 180), 'darkseagreen3': (155, 205, 155),
+        'darkseagreen4': (105, 139, 105), 'darkslateblue': (72, 61, 139),
+        'darkslategray': (47, 79, 79), 'darkslategray1': (151, 255, 255),
+        'darkslategray2': (141, 238, 238), 'darkslategray3': (121, 205, 205),
+        'darkslategray4': (82, 139, 139), 'darkslategrey': (47, 79, 79),
+        'darkturquoise': (0, 206, 209), 'darkviolet': (148,  0, 211),
+        'deeppink': (255, 20, 147), 'deeppink1': (255, 20, 147),
+        'deeppink2': (238, 18, 137), 'deeppink3': (205, 16, 118),
+        'deeppink4': (139, 10, 80), 'deepskyblue': (0, 191, 255),
+        'deepskyblue1': (0, 191, 255), 'deepskyblue2': (0, 178, 238),
+        'deepskyblue3': (0, 154, 205), 'deepskyblue4': (0, 104, 139),
+        'dimgray': (105, 105, 105), 'dimgrey': (105, 105, 105),
+        'dodgerblue': (30, 144, 255), 'dodgerblue1': (30, 144, 255),
+        'dodgerblue2': (28, 134, 238), 'dodgerblue3': (24, 116, 205),
+        'dodgerblue4': (16, 78, 139), 'firebrick': (178, 34, 34),
+        'firebrick1': (255, 48, 48), 'firebrick2': (238, 44, 44),
+        'firebrick3': (205, 38, 38), 'firebrick4': (139, 26, 26),
+        'floralwhite': (255, 250, 240), 'forestgreen': (34, 139, 34),
+        'gainsboro': (220, 220, 220), 'ghostwhite': (248, 248, 255),
+        'gold': (255, 215,  0), 'gold1': (255, 215,  0),
+        'gold2': (238, 201,  0), 'gold3': (205, 173,  0),
+        'gold4': (139, 117,  0), 'goldenrod': (218, 165, 32),
+        'goldenrod1': (255, 193, 37), 'goldenrod2': (238, 180, 34),
+        'goldenrod3': (205, 155, 29), 'goldenrod4': (139, 105, 20),
+        'gray': (190, 190, 190), 'gray0': (0,  0,  0),
+        'gray1': (3,  3,  3), 'gray10': (26, 26, 26),
+        'gray100': (255, 255, 255), 'gray11': (28, 28, 28),
+        'gray12': (31, 31, 31), 'gray13': (33, 33, 33),
+        'gray14': (36, 36, 36), 'gray15': (38, 38, 38),
+        'gray16': (41, 41, 41), 'gray17': (43, 43, 43),
+        'gray18': (46, 46, 46), 'gray19': (48, 48, 48),
+        'gray2': (5,  5,  5), 'gray20': (51, 51, 51),
+        'gray21': (54, 54, 54), 'gray22': (56, 56, 56),
+        'gray23': (59, 59, 59), 'gray24': (61, 61, 61),
+        'gray25': (64, 64, 64), 'gray26': (66, 66, 66),
+        'gray27': (69, 69, 69), 'gray28': (71, 71, 71),
+        'gray29': (74, 74, 74), 'gray3': (8,  8,  8),
+        'gray30': (77, 77, 77), 'gray31': (79, 79, 79),
+        'gray32': (82, 82, 82), 'gray33': (84, 84, 84),
+        'gray34': (87, 87, 87), 'gray35': (89, 89, 89),
+        'gray36': (92, 92, 92), 'gray37': (94, 94, 94),
+        'gray38': (97, 97, 97), 'gray39': (99, 99, 99),
+        'gray4': (10, 10, 10), 'gray40': (102, 102, 102),
+        'gray41': (105, 105, 105), 'gray42': (107, 107, 107),
+        'gray43': (110, 110, 110), 'gray44': (112, 112, 112),
+        'gray45': (115, 115, 115), 'gray46': (117, 117, 117),
+        'gray47': (120, 120, 120), 'gray48': (122, 122, 122),
+        'gray49': (125, 125, 125), 'gray5': (13, 13, 13),
+        'gray50': (127, 127, 127), 'gray51': (130, 130, 130),
+        'gray52': (133, 133, 133), 'gray53': (135, 135, 135),
+        'gray54': (138, 138, 138), 'gray55': (140, 140, 140),
+        'gray56': (143, 143, 143), 'gray57': (145, 145, 145),
+        'gray58': (148, 148, 148), 'gray59': (150, 150, 150),
+        'gray6': (15, 15, 15), 'gray60': (153, 153, 153),
+        'gray61': (156, 156, 156), 'gray62': (158, 158, 158),
+        'gray63': (161, 161, 161), 'gray64': (163, 163, 163),
+        'gray65': (166, 166, 166), 'gray66': (168, 168, 168),
+        'gray67': (171, 171, 171), 'gray68': (173, 173, 173),
+        'gray69': (176, 176, 176), 'gray7': (18, 18, 18),
+        'gray70': (179, 179, 179), 'gray71': (181, 181, 181),
+        'gray72': (184, 184, 184), 'gray73': (186, 186, 186),
+        'gray74': (189, 189, 189), 'gray75': (191, 191, 191),
+        'gray76': (194, 194, 194), 'gray77': (196, 196, 196),
+        'gray78': (199, 199, 199), 'gray79': (201, 201, 201),
+        'gray8': (20, 20, 20), 'gray80': (204, 204, 204),
+        'gray81': (207, 207, 207), 'gray82': (209, 209, 209),
+        'gray83': (212, 212, 212), 'gray84': (214, 214, 214),
+        'gray85': (217, 217, 217), 'gray86': (219, 219, 219),
+        'gray87': (222, 222, 222), 'gray88': (224, 224, 224),
+        'gray89': (227, 227, 227), 'gray9': (23, 23, 23),
+        'gray90': (229, 229, 229), 'gray91': (232, 232, 232),
+        'gray92': (235, 235, 235), 'gray93': (237, 237, 237),
+        'gray94': (240, 240, 240), 'gray95': (242, 242, 242),
+        'gray96': (245, 245, 245), 'gray97': (247, 247, 247),
+        'gray98': (250, 250, 250), 'gray99': (252, 252, 252),
+        'green': (0, 255,  0), 'green1': (0, 255,  0),
+        'green2': (0, 238,  0), 'green3': (0, 205,  0),
+        'green4': (0, 139,  0), 'greenyellow': (173, 255, 47),
+        'grey': (190, 190, 190), 'grey0': (0,  0,  0),
+        'grey1': (3,  3,  3), 'grey10': (26, 26, 26),
+        'grey100': (255, 255, 255), 'grey11': (28, 28, 28),
+        'grey12': (31, 31, 31), 'grey13': (33, 33, 33),
+        'grey14': (36, 36, 36), 'grey15': (38, 38, 38),
+        'grey16': (41, 41, 41), 'grey17': (43, 43, 43),
+        'grey18': (46, 46, 46), 'grey19': (48, 48, 48),
+        'grey2': (5,  5,  5), 'grey20': (51, 51, 51),
+        'grey21': (54, 54, 54), 'grey22': (56, 56, 56),
+        'grey23': (59, 59, 59), 'grey24': (61, 61, 61),
+        'grey25': (64, 64, 64), 'grey26': (66, 66, 66),
+        'grey27': (69, 69, 69), 'grey28': (71, 71, 71),
+        'grey29': (74, 74, 74), 'grey3': (8,  8,  8),
+        'grey30': (77, 77, 77), 'grey31': (79, 79, 79),
+        'grey32': (82, 82, 82), 'grey33': (84, 84, 84),
+        'grey34': (87, 87, 87), 'grey35': (89, 89, 89),
+        'grey36': (92, 92, 92), 'grey37': (94, 94, 94),
+        'grey38': (97, 97, 97), 'grey39': (99, 99, 99),
+        'grey4': (10, 10, 10), 'grey40': (102, 102, 102),
+        'grey41': (105, 105, 105), 'grey42': (107, 107, 107),
+        'grey43': (110, 110, 110), 'grey44': (112, 112, 112),
+        'grey45': (115, 115, 115), 'grey46': (117, 117, 117),
+        'grey47': (120, 120, 120), 'grey48': (122, 122, 122),
+        'grey49': (125, 125, 125), 'grey5': (13, 13, 13),
+        'grey50': (127, 127, 127), 'grey51': (130, 130, 130),
+        'grey52': (133, 133, 133), 'grey53': (135, 135, 135),
+        'grey54': (138, 138, 138), 'grey55': (140, 140, 140),
+        'grey56': (143, 143, 143), 'grey57': (145, 145, 145),
+        'grey58': (148, 148, 148), 'grey59': (150, 150, 150),
+        'grey6': (15, 15, 15), 'grey60': (153, 153, 153),
+        'grey61': (156, 156, 156), 'grey62': (158, 158, 158),
+        'grey63': (161, 161, 161), 'grey64': (163, 163, 163),
+        'grey65': (166, 166, 166), 'grey66': (168, 168, 168),
+        'grey67': (171, 171, 171), 'grey68': (173, 173, 173),
+        'grey69': (176, 176, 176), 'grey7': (18, 18, 18),
+        'grey70': (179, 179, 179), 'grey71': (181, 181, 181),
+        'grey72': (184, 184, 184), 'grey73': (186, 186, 186),
+        'grey74': (189, 189, 189), 'grey75': (191, 191, 191),
+        'grey76': (194, 194, 194), 'grey77': (196, 196, 196),
+        'grey78': (199, 199, 199), 'grey79': (201, 201, 201),
+        'grey8': (20, 20, 20), 'grey80': (204, 204, 204),
+        'grey81': (207, 207, 207), 'grey82': (209, 209, 209),
+        'grey83': (212, 212, 212), 'grey84': (214, 214, 214),
+        'grey85': (217, 217, 217), 'grey86': (219, 219, 219),
+        'grey87': (222, 222, 222), 'grey88': (224, 224, 224),
+        'grey89': (227, 227, 227), 'grey9': (23, 23, 23),
+        'grey90': (229, 229, 229), 'grey91': (232, 232, 232),
+        'grey92': (235, 235, 235), 'grey93': (237, 237, 237),
+        'grey94': (240, 240, 240), 'grey95': (242, 242, 242),
+        'grey96': (245, 245, 245), 'grey97': (247, 247, 247),
+        'grey98': (250, 250, 250), 'grey99': (252, 252, 252),
+        'honeydew': (240, 255, 240), 'honeydew1': (240, 255, 240),
+        'honeydew2': (224, 238, 224), 'honeydew3': (193, 205, 193),
+        'honeydew4': (131, 139, 131), 'hotpink': (255, 105, 180),
+        'hotpink1': (255, 110, 180), 'hotpink2': (238, 106, 167),
+        'hotpink3': (205, 96, 144), 'hotpink4': (139, 58, 98),
+        'indianred': (205, 92, 92), 'indianred1': (255, 106, 106),
+        'indianred2': (238, 99, 99), 'indianred3': (205, 85, 85),
+        'indianred4': (139, 58, 58), 'ivory': (255, 255, 240),
+        'ivory1': (255, 255, 240), 'ivory2': (238, 238, 224),
+        'ivory3': (205, 205, 193), 'ivory4': (139, 139, 131),
+        'khaki': (240, 230, 140), 'khaki1': (255, 246, 143),
+        'khaki2': (238, 230, 133), 'khaki3': (205, 198, 115),
+        'khaki4': (139, 134, 78), 'lavender': (230, 230, 250),
+        'lavenderblush': (255, 240, 245), 'lavenderblush1': (255, 240, 245),
+        'lavenderblush2': (238, 224, 229), 'lavenderblush3': (205, 193, 197),
+        'lavenderblush4': (139, 131, 134), 'lawngreen': (124, 252,  0),
+        'lemonchiffon': (255, 250, 205), 'lemonchiffon1': (255, 250, 205),
+        'lemonchiffon2': (238, 233, 191), 'lemonchiffon3': (205, 201, 165),
+        'lemonchiffon4': (139, 137, 112), 'lightblue': (173, 216, 230),
+        'lightblue1': (191, 239, 255), 'lightblue2': (178, 223, 238),
+        'lightblue3': (154, 192, 205), 'lightblue4': (104, 131, 139),
+        'lightcoral': (240, 128, 128), 'lightcyan': (224, 255, 255),
+        'lightcyan1': (224, 255, 255), 'lightcyan2': (209, 238, 238),
+        'lightcyan3': (180, 205, 205), 'lightcyan4': (122, 139, 139),
+        'lightgoldenrod': (238, 221, 130), 'lightgoldenrod1': (255, 236, 139),
+        'lightgoldenrod2': (238, 220, 130), 'lightgoldenrod3': (205, 190, 112),
+        'lightgoldenrod4': (139, 129, 76), 'lightgoldenrodyellow': (250, 250, 210),
+        'lightgray': (211, 211, 211), 'lightgreen': (144, 238, 144),
+        'lightgrey': (211, 211, 211), 'lightpink': (255, 182, 193),
+        'lightpink1': (255, 174, 185), 'lightpink2': (238, 162, 173),
+        'lightpink3': (205, 140, 149), 'lightpink4': (139, 95, 101),
+        'lightsalmon': (255, 160, 122), 'lightsalmon1': (255, 160, 122),
+        'lightsalmon2': (238, 149, 114), 'lightsalmon3': (205, 129, 98),
+        'lightsalmon4': (139, 87, 66), 'lightseagreen': (32, 178, 170),
+        'lightskyblue': (135, 206, 250), 'lightskyblue1': (176, 226, 255),
+        'lightskyblue2': (164, 211, 238), 'lightskyblue3': (141, 182, 205),
+        'lightskyblue4': (96, 123, 139), 'lightslateblue': (132, 112, 255),
+        'lightslategray': (119, 136, 153), 'lightslategrey': (119, 136, 153),
+        'lightsteelblue': (176, 196, 222), 'lightsteelblue1': (202, 225, 255),
+        'lightsteelblue2': (188, 210, 238), 'lightsteelblue3': (162, 181, 205),
+        'lightsteelblue4': (110, 123, 139), 'lightyellow': (255, 255, 224),
+        'lightyellow1': (255, 255, 224), 'lightyellow2': (238, 238, 209),
+        'lightyellow3': (205, 205, 180), 'lightyellow4': (139, 139, 122),
+        'limegreen': (50, 205, 50), 'linen': (250, 240, 230),
+        'magenta': (255,  0, 255), 'magenta1': (255,  0, 255),
+        'magenta2': (238,  0, 238), 'magenta3': (205,  0, 205),
+        'magenta4': (139,  0, 139), 'maroon': (176, 48, 96),
+        'maroon1': (255, 52, 179), 'maroon2': (238, 48, 167),
+        'maroon3': (205, 41, 144), 'maroon4': (139, 28, 98),
+        'mediumaquamarine': (102, 205, 170), 'mediumblue': (0,  0, 205),
+        'mediumorchid': (186, 85, 211), 'mediumorchid1': (224, 102, 255),
+        'mediumorchid2': (209, 95, 238), 'mediumorchid3': (180, 82, 205),
+        'mediumorchid4': (122, 55, 139), 'mediumpurple': (147, 112, 219),
+        'mediumpurple1': (171, 130, 255), 'mediumpurple2': (159, 121, 238),
+        'mediumpurple3': (137, 104, 205), 'mediumpurple4': (93, 71, 139),
+        'mediumseagreen': (60, 179, 113), 'mediumslateblue': (123, 104, 238),
+        'mediumspringgreen': (0, 250, 154), 'mediumturquoise': (72, 209, 204),
+        'mediumvioletred': (199, 21, 133), 'midnightblue': (25, 25, 112),
+        'mintcream': (245, 255, 250), 'mistyrose': (255, 228, 225),
+        'mistyrose1': (255, 228, 225), 'mistyrose2': (238, 213, 210),
+        'mistyrose3': (205, 183, 181), 'mistyrose4': (139, 125, 123),
+        'moccasin': (255, 228, 181), 'navajowhite': (255, 222, 173),
+        'navajowhite1': (255, 222, 173), 'navajowhite2': (238, 207, 161),
+        'navajowhite3': (205, 179, 139), 'navajowhite4': (139, 121, 94),
+        'navy': (0,  0, 128), 'navyblue': (0,  0, 128),
+        'oldlace': (253, 245, 230), 'olivedrab': (107, 142, 35),
+        'olivedrab1': (192, 255, 62), 'olivedrab2': (179, 238, 58),
+        'olivedrab3': (154, 205, 50), 'olivedrab4': (105, 139, 34),
+        'orange': (255, 165,  0), 'orange1': (255, 165,  0),
+        'orange2': (238, 154,  0), 'orange3': (205, 133,  0),
+        'orange4': (139, 90,  0), 'orangered': (255, 69,  0),
+        'orangered1': (255, 69,  0), 'orangered2': (238, 64,  0),
+        'orangered3': (205, 55,  0), 'orangered4': (139, 37,  0),
+        'orchid': (218, 112, 214), 'orchid1': (255, 131, 250),
+        'orchid2': (238, 122, 233), 'orchid3': (205, 105, 201),
+        'orchid4': (139, 71, 137), 'palegoldenrod': (238, 232, 170),
+        'palegreen': (152, 251, 152), 'palegreen1': (154, 255, 154),
+        'palegreen2': (144, 238, 144), 'palegreen3': (124, 205, 124),
+        'palegreen4': (84, 139, 84), 'paleturquoise': (175, 238, 238),
+        'paleturquoise1': (187, 255, 255), 'paleturquoise2': (174, 238, 238),
+        'paleturquoise3': (150, 205, 205), 'paleturquoise4': (102, 139, 139),
+        'palevioletred': (219, 112, 147), 'palevioletred1': (255, 130, 171),
+        'palevioletred2': (238, 121, 159), 'palevioletred3': (205, 104, 137),
+        'palevioletred4': (139, 71, 93), 'papayawhip': (255, 239, 213),
+        'peachpuff': (255, 218, 185), 'peachpuff1': (255, 218, 185),
+        'peachpuff2': (238, 203, 173), 'peachpuff3': (205, 175, 149),
+        'peachpuff4': (139, 119, 101), 'peru': (205, 133, 63),
+        'pink': (255, 192, 203), 'pink1': (255, 181, 197),
+        'pink2': (238, 169, 184), 'pink3': (205, 145, 158),
+        'pink4': (139, 99, 108), 'plum': (221, 160, 221),
+        'plum1': (255, 187, 255), 'plum2': (238, 174, 238),
+        'plum3': (205, 150, 205), 'plum4': (139, 102, 139),
+        'powderblue': (176, 224, 230), 'purple': (160, 32, 240),
+        'purple1': (155, 48, 255), 'purple2': (145, 44, 238),
+        'purple3': (125, 38, 205), 'purple4': (85, 26, 139),
+        'red': (255,  0,  0), 'red1': (255,  0,  0),
+        'red2': (238,  0,  0), 'red3': (205,  0,  0),
+        'red4': (139,  0,  0), 'rosybrown': (188, 143, 143),
+        'rosybrown1': (255, 193, 193), 'rosybrown2': (238, 180, 180),
+        'rosybrown3': (205, 155, 155), 'rosybrown4': (139, 105, 105),
+        'royalblue': (65, 105, 225), 'royalblue1': (72, 118, 255),
+        'royalblue2': (67, 110, 238), 'royalblue3': (58, 95, 205),
+        'royalblue4': (39, 64, 139), 'saddlebrown': (139, 69, 19),
+        'salmon': (250, 128, 114), 'salmon1': (255, 140, 105),
+        'salmon2': (238, 130, 98), 'salmon3': (205, 112, 84),
+        'salmon4': (139, 76, 57), 'sandybrown': (244, 164, 96),
+        'seagreen': (46, 139, 87), 'seagreen1': (84, 255, 159),
+        'seagreen2': (78, 238, 148), 'seagreen3': (67, 205, 128),
+        'seagreen4': (46, 139, 87), 'seashell': (255, 245, 238),
+        'seashell1': (255, 245, 238), 'seashell2': (238, 229, 222),
+        'seashell3': (205, 197, 191), 'seashell4': (139, 134, 130),
+        'sienna': (160, 82, 45), 'sienna1': (255, 130, 71),
+        'sienna2': (238, 121, 66), 'sienna3': (205, 104, 57),
+        'sienna4': (139, 71, 38), 'skyblue': (135, 206, 235),
+        'skyblue1': (135, 206, 255), 'skyblue2': (126, 192, 238),
+        'skyblue3': (108, 166, 205), 'skyblue4': (74, 112, 139),
+        'slateblue': (106, 90, 205), 'slateblue1': (131, 111, 255),
+        'slateblue2': (122, 103, 238), 'slateblue3': (105, 89, 205),
+        'slateblue4': (71, 60, 139), 'slategray': (112, 128, 144),
+        'slategray1': (198, 226, 255), 'slategray2': (185, 211, 238),
+        'slategray3': (159, 182, 205), 'slategray4': (108, 123, 139),
+        'slategrey': (112, 128, 144), 'snow': (255, 250, 250),
+        'snow1': (255, 250, 250), 'snow2': (238, 233, 233),
+        'snow3': (205, 201, 201), 'snow4': (139, 137, 137),
+        'springgreen': (0, 255, 127), 'springgreen1': (0, 255, 127),
+        'springgreen2': (0, 238, 118), 'springgreen3': (0, 205, 102),
+        'springgreen4': (0, 139, 69), 'steelblue': (70, 130, 180),
+        'steelblue1': (99, 184, 255), 'steelblue2': (92, 172, 238),
+        'steelblue3': (79, 148, 205), 'steelblue4': (54, 100, 139),
+        'tan': (210, 180, 140), 'tan1': (255, 165, 79),
+        'tan2': (238, 154, 73), 'tan3': (205, 133, 63),
+        'tan4': (139, 90, 43), 'thistle': (216, 191, 216),
+        'thistle1': (255, 225, 255), 'thistle2': (238, 210, 238),
+        'thistle3': (205, 181, 205), 'thistle4': (139, 123, 139),
+        'tomato': (255, 99, 71), 'tomato1': (255, 99, 71),
+        'tomato2': (238, 92, 66), 'tomato3': (205, 79, 57),
+        'tomato4': (139, 54, 38), 'turquoise': (64, 224, 208),
+        'turquoise1': (0, 245, 255), 'turquoise2': (0, 229, 238),
+        'turquoise3': (0, 197, 205), 'turquoise4': (0, 134, 139),
+        'violet': (238, 130, 238), 'violetred': (208, 32, 144),
+        'violetred1': (255, 62, 150), 'violetred2': (238, 58, 140),
+        'violetred3': (205, 50, 120), 'violetred4': (139, 34, 82),
+        'wheat': (245, 222, 179), 'wheat1': (255, 231, 186),
+        'wheat2': (238, 216, 174), 'wheat3': (205, 186, 150),
+        'wheat4': (139, 126, 102), 'white': (255, 255, 255),
+        'whitesmoke': (245, 245, 245), 'yellow': (255, 255,  0),
+        'yellow1': (255, 255,  0), 'yellow2': (238, 238,  0),
+        'yellow3': (205, 205,  0), 'yellow4': (139, 139,  0),
+        'yellowgreen': (154, 205, 50),
+    }
 
     AVAILABLE = list(_colorValues.keys())
     AVAILABLE.sort()
@@ -2319,7 +2583,7 @@ class Color(object):
 
         This static method should be invoked as Color.randomColor().
         """
-        return Color( (_random.randint(0, 255), _random.randint(0, 255), _random.randint(0, 255)) )
+        return Color((_random.randint(0, 255), _random.randint(0, 255), _random.randint(0, 255)))
     randomColor = staticmethod(randomColor)
 
     def __init__(self, colorChoice='white'):
@@ -2370,7 +2634,7 @@ class Color(object):
         """
         if not isinstance(colorName, basestring):
             raise TypeError('string expected as color name')
-        cleanName = colorName.lower().replace(' ','')
+        cleanName = colorName.lower().replace(' ', '')
         if cleanName == 'transparent':
             if self._isCanvasBackground():
                 raise ValueError('canvas background cannot be transparent')
@@ -2397,7 +2661,7 @@ class Color(object):
         """Set the color to the given tuple of (red, green, blue) values."""
         if not isinstance(rgbTuple, tuple):
             raise TypeError('(r,g,b) tuple expected')
-        if len(rgbTuple)!=3:
+        if len(rgbTuple) != 3:
             raise ValueError('(r,g,b) tuple must have three components')
         for val in rgbTuple:
             if not isinstance(val, (int, float)):
@@ -2430,8 +2694,13 @@ class Color(object):
 
     def __eq__(self, other):
         """Return true if the two colors have equivalent value."""
-        return ( (self._transparent, self._colorValue) ==
-                 (other._transparent, other._colorValue) )
+        if not isinstance(other, Color):
+            try:
+                other = Color(other)
+            except (TypeError, ValueError):
+                return False
+        return ((self._transparent, self._colorValue) ==
+                (other._transparent, other._colorValue))
 
     def __ne__(self, other):
         """Return true if the two colors do not have equivalent value."""
@@ -2440,15 +2709,15 @@ class Color(object):
     def _register(self, user, role):
         """Register a user with this Color instance."""
         if user not in self._users:
-            self._users.add( (user,role) )
+            self._users.add((user, role))
 
     def _unregister(self, user, role):
         """Unregister a user from this Color instance."""
-        self._users.discard( (user,role) )
+        self._users.discard((user, role))
 
     def _isCanvasBackground(self):
         """Check to see if this Color instance is currently registered with a Canvas."""
-        for (user,role) in self._users:
+        for (user, role) in self._users:
             if isinstance(user, Canvas):
                 return True
         return False
@@ -2456,18 +2725,20 @@ class Color(object):
     def _informUsers(self):
         """Inform registered users that the Color instance is mutated."""
         temp = Color(self)
-        for (user,role) in self._users:
-            user._update({role : temp})
+        for (user, role) in self._users:
+            user._update({role: temp})
 
     @staticmethod
     def _getTkColor(color):
         if color._transparent:
             return ''
-        return '#%04X%04X%04X' % (256*color.getColorValue()[0], 256*color.getColorValue()[1], 256*color.getColorValue()[2])
+        return '#%04X%04X%04X' % (256 * color.getColorValue()[0], 256 * color.getColorValue()[1], 256 * color.getColorValue()[2])
 
 
 class _GraphicsContainer(object):
+
     def __init__(self):
+        super(_GraphicsContainer, self).__init__()
         self._contents = []
 
     def __contains__(self, obj):
@@ -2479,11 +2750,14 @@ class _GraphicsContainer(object):
         # not doing error checking here, as we want tailored messages for Canvas and Layer
         self._contents.append(drawable)
         if self in _graphicsManager._frontHierarchy:
-            if _debug >= 2: print('adding drawable to "rendered" graphics container')
+            if _DEBUG['Front'] >= 2:
+                print('adding drawable to "rendered" graphics container')
             _graphicsManager.beginRefresh()
-            cacheParent = _graphicsManager._drawParent   # probably None.  But not quite sure
-            cls = Canvas if isinstance(self, Canvas) else Layer    # although possible subclass of Layer
-            _graphicsManager._drawParent = (self,cls)
+            # probably None.  But not quite sure
+            cacheParent = _graphicsManager._drawParent
+            # or should this be type(self) for subclasses?
+            cls = Canvas if isinstance(self, Canvas) else Layer
+            _graphicsManager._drawParent = (self, cls)
             drawable._draw()
             _graphicsManager._drawParent = cacheParent
             _graphicsManager.completeRefresh()
@@ -2493,13 +2767,18 @@ class _GraphicsContainer(object):
         # not doing error checking here, as we want tailored messages for Canvas and Layer
         self._contents.remove(drawable)
         if drawable in _graphicsManager._frontHierarchy:
+            # or should this be type(self) for subclasses?
             cls = Canvas if isinstance(self, Canvas) else Layer
             _graphicsManager.beginRefresh()
-            childTuple = _graphicsManager._frontHierarchy.findChildTuple((self,cls), drawable)
-            if _debug >= 1:
-                print('_frontHierarchy.removeLink: ' + str( (self,cls) ) + ' ' + str(childTuple))
-            _graphicsManager._frontHierarchy.removeLink((self,cls), childTuple)
-            _graphicsManager.addCommandToQueue(('object removed', (self,cls), childTuple))
+            childTuple = _graphicsManager._frontHierarchy.findChildTuple(
+                (self, cls), drawable)
+            if _DEBUG['Front'] >= 1:
+                print('_frontHierarchy.removeLink: ' +
+                      str((self, cls)) + ' ' + str(childTuple))
+            _graphicsManager._frontHierarchy.removeLink(
+                (self, cls), childTuple)
+            _graphicsManager.addCommandToQueue(
+                ('object removed', (self, cls), childTuple))
             _graphicsManager.completeRefresh()
 
     def clear(self):
@@ -2518,7 +2797,8 @@ class _GraphicsContainer(object):
             except AttributeError:
                 self.setAutoRefresh(False)    # presumably a Canvas
 
-        contents = list(self._contents)       # intentional clone since remove mutates list
+        # intentional clone since remove mutates list
+        contents = list(self._contents)
         for drawable in contents:
             self.remove(drawable)
 
@@ -2533,46 +2813,58 @@ class _GraphicsContainer(object):
         # this is not currently used by our code, but there for users
         return sorted(self._contents, key=Drawable.getDepth, reverse=True)
 
+
 def _wrapUtility(cls):
-    if _debug >= 2: print('_wrapUtility being called on class ' + str(cls))
+    if _DEBUG['Front'] >= 2:
+        print('_wrapUtility being called on class ' + str(cls))
     classDict = cls.__dict__
     if '_internalDraw' not in classDict:   # not alreadly wrapped
         if '_draw' in classDict:
-            if _debug >= 2: print('_wrapUtility: wrap was required')
+            if _DEBUG['Front'] >= 2:
+                print('_wrapUtility: wrap was required')
             internalDraw = cls._draw
             setattr(cls, '_internalDraw', internalDraw)
-    
-            #---------------------------------------------------------------------------
+
+            # ---------------------------------------------------------------------------
             # defining closure to wrap the original _draw while identifying proper class
             def drawClosure(self):
                 # Note: cls and internalDraw taken from the closure
-                if _debug >= 2: print(str(cls) + ' draw wrapper called on ' + str(self))
+                if _DEBUG['Front'] >= 2:
+                    print(str(cls) + ' draw wrapper called on ' + str(self))
                 parent = _graphicsManager._drawParent
                 if not parent:
-                    raise GraphicsError('_draw should not be directly called', True)
-        
+                    raise GraphicsError(
+                        '_draw should not be directly called', True)
+
                 siblings = _graphicsManager._drawChildren
                 if siblings is not None:
-                    siblings.append( (self,cls) )
-        
-                known = self in _graphicsManager._frontHierarchy        # query this before adding to hierarchy
-                if _debug >= 1:
-                    print('\n_frontHierarchy.addLink: ' + str(parent) + ' ' + str( (self,cls) ))
+                    siblings.append((self, cls))
 
-                _graphicsManager._frontHierarchy.addLink(parent, (self,cls))
+                # query this before adding to hierarchy
+                known = self in _graphicsManager._frontHierarchy
+                if _DEBUG['Front'] >= 1:
+                    print('\n_frontHierarchy.addLink: ' +
+                          str(parent) + ' ' + str((self, cls)))
+
+                _graphicsManager._frontHierarchy.addLink(parent, (self, cls))
                 if not known:
-                    _graphicsManager.addCommandToQueue(('update', self, self._getProperties())) # presend all properties
-                _graphicsManager.addCommandToQueue(('object added', parent, (self,cls)))
-        
+                    _graphicsManager.addCommandToQueue(
+                        ('update', self, self._getProperties()))  # presend all properties
+                _graphicsManager.addCommandToQueue(
+                    ('object added', parent, (self, cls)))
+
                 if not known:
-                    if _debug >= 2: print('about to call original _draw() for ' + str(self))
-                    _graphicsManager._drawParent = (self,cls)
-                    internalDraw(self)           # the original wrapped function, taken from closure
+                    if _DEBUG['Front'] >= 2:
+                        print('about to call original _draw() for ' + str(self))
+                    _graphicsManager._drawParent = (self, cls)
+                    # the original wrapped function, taken from closure
+                    internalDraw(self)
                     _graphicsManager._drawParent = parent
-            
-                if _debug >= 2: print('draw wrapper call ending for ' + str(self))
+
+                if _DEBUG['Front'] >= 2:
+                    print(str(cls) + ' draw wrapper call ending for ' + str(self))
             # end of closure
-            #---------------------------------------------------------------------------
+            # ---------------------------------------------------------------------------
             setattr(cls, '_draw', drawClosure)
 
         # if _internalDraw exists, then parents are already wrapped as well,
@@ -2584,6 +2876,7 @@ def _wrapUtility(cls):
 
 # Drawable Hierarchy
 class Drawable(_EventTrigger):
+
     """An object that can be drawn to a graphics canvas."""
 
     def __init__(self, reference=None):
@@ -2592,7 +2885,7 @@ class Drawable(_EventTrigger):
         referencePoint  local reference point for scaling, rotating and flipping
                         (default Point(0,0) )
         """
-        _EventTrigger.__init__(self)
+        super(Drawable, self).__init__()
         _wrapUtility(self.__class__)
 
         if reference is not None:
@@ -2612,18 +2905,18 @@ class Drawable(_EventTrigger):
         # Subtypes can customize as needed.
         temp = self.__class__.__new__(self.__class__)
         memo[id(self)] = temp
-        for k,v in self.__dict__.items():
+        for k, v in self.__dict__.items():
             temp.__dict__[k] = _copy.deepcopy(v, memo)
         return temp
 
     # TODO: get rid of this. temporary hack for 3.0 issue and comparing chains
     def __lt__(self, other):
         return id(self) < id(other)
-            
+
     def isFrozen(self):
         """Returns True if currently frozen; False otherwise."""
         return self._frozen
-    
+
     def freeze(self):
         """Freeze the current object (if not already frozen).
 
@@ -2662,36 +2955,37 @@ class Drawable(_EventTrigger):
         For the default coordinate system, positive dx is rightward and
         negative is leftward; positive dy is downard and negative is upward.
         """
-        if not isinstance(dx, (int,float)):
+        if not isinstance(dx, (int, float)):
             raise TypeError('dx must be numeric')
-        if not isinstance(dy, (int,float)):
+        if not isinstance(dy, (int, float)):
             raise TypeError('dy must be numeric')
-        self._transform = _Transformation( (1.,0.,0.,1.,dx,dy)) * self._transform
+        self._transform = _Transformation(
+            (1., 0., 0., 1., dx, dy)) * self._transform
         self._update({'transformation': self._transform})
 
     def moveTo(self, x, y):
         """Move the object to align its reference point with (x,y)"""
-        if not isinstance(x, (int,float)):
+        if not isinstance(x, (int, float)):
             raise TypeError('x must be numeric')
-        if not isinstance(y, (int,float)):
+        if not isinstance(y, (int, float)):
             raise TypeError('y must be numeric')
         curRef = self.getReferencePoint()
-        self.move(x-curRef.getX(), y-curRef.getY())
+        self.move(x - curRef.getX(), y - curRef.getY())
 
     def rotate(self, angle):
         """Rotate the object around its current reference point.
 
         angle  number of degrees of clockwise rotation
         """
-        if not isinstance(angle, (int,float)):
+        if not isinstance(angle, (int, float)):
             raise TypeError('angle must be numeric')
-        angle = -_math.pi*angle/180.
+        angle = -_math.pi * angle / 180.
         p = self._localToGlobal(self._reference)
-        trans = _Transformation((1.,0.,0.,1.)+p.get())
-        rot = _Transformation((_math.cos(angle),_math.sin(angle),
-                               -_math.sin(angle),_math.cos(angle),0.,0.))
+        trans = _Transformation((1., 0., 0., 1.) + p.get())
+        rot = _Transformation((_math.cos(angle), _math.sin(angle),
+                               -_math.sin(angle), _math.cos(angle), 0., 0.))
 
-        self._transform = trans*(rot*(trans.inv()*self._transform))
+        self._transform = trans * (rot * (trans.inv() * self._transform))
         self._update({'transformation': self._transform})
 
     def scale(self, factor):
@@ -2699,16 +2993,16 @@ class Drawable(_EventTrigger):
 
         factor      scale is multiplied by this number (must be positive)
         """
-        if not isinstance(factor, (int,float)):
+        if not isinstance(factor, (int, float)):
             raise TypeError('scaling factor must be a positive number')
         if factor <= 0:
             raise ValueError('scaling factor must be a positive number')
 
         p = self._localToGlobal(self._reference)
-        trans = _Transformation((1.,0.,0.,1.)+p.get())
-        sca = _Transformation((factor,0.,0.,factor,0.,0.))
+        trans = _Transformation((1., 0., 0., 1.) + p.get())
+        sca = _Transformation((factor, 0., 0., factor, 0., 0.))
 
-        self._transform = trans*(sca*(trans.inv()*self._transform))
+        self._transform = trans * (sca * (trans.inv() * self._transform))
         self._update({'transformation': self._transform})
 
     def stretch(self, xFactor, yFactor, angle=0):
@@ -2719,19 +3013,20 @@ class Drawable(_EventTrigger):
         parameter rotates the directions that the streching is performed
         along.
         """
-        if not isinstance(xFactor, (int,float)) or not isinstance(yFactor, (int,float)):
+        if not isinstance(xFactor, (int, float)) or not isinstance(yFactor, (int, float)):
             raise TypeError('stretch factor must be a positive number')
-        if xFactor<=0 or yFactor<=0:
+        if xFactor <= 0 or yFactor <= 0:
             raise ValueError('stretch factor must be a positive number')
 
         p = self._localToGlobal(self._reference)
-        trans = _Transformation((1.,0.,0.,1.)+p.get())
-        rot = _Transformation((_math.cos(angle),_math.sin(angle),
-                               -_math.sin(angle),_math.cos(angle),0.,0.))
+        trans = _Transformation((1., 0., 0., 1.) + p.get())
+        rot = _Transformation((_math.cos(angle), _math.sin(angle),
+                               -_math.sin(angle), _math.cos(angle), 0., 0.))
         rotinv = rot.inv()
-        sca = _Transformation((xFactor,0.,0.,yFactor,0.,0.))
+        sca = _Transformation((xFactor, 0., 0., yFactor, 0., 0.))
 
-        self._transform = trans*(rotinv*(sca*(rot*(trans.inv()*self._transform))))
+        self._transform = trans * \
+            (rotinv * (sca * (rot * (trans.inv() * self._transform))))
         self._update({'transformation': self._transform})
 
     def flip(self, angle=0):
@@ -2741,18 +3036,19 @@ class Drawable(_EventTrigger):
 
         angle     a clockwise rotation of the axis of symmetry away from vertical
         """
-        if not isinstance(angle, (int,float)):
+        if not isinstance(angle, (int, float)):
             raise TypeError('angle must be numeric')
 
-        angle = _math.pi*angle/180.
+        angle = _math.pi * angle / 180.
         p = self._localToGlobal(self._reference)
-        trans = _Transformation((1.,0.,0.,1.)+p.get())
-        rot = _Transformation((_math.cos(angle),_math.sin(angle),
-                               -_math.sin(angle),_math.cos(angle),0.,0.))
+        trans = _Transformation((1., 0., 0., 1.) + p.get())
+        rot = _Transformation((_math.cos(angle), _math.sin(angle),
+                               -_math.sin(angle), _math.cos(angle), 0., 0.))
         rotinv = rot.inv()
-        invert = _Transformation((-1.,0.,0.,1.,0.,0.))
+        invert = _Transformation((-1., 0., 0., 1., 0., 0.))
 
-        self._transform = trans*(rotinv*(invert*(rot*(trans.inv()*self._transform))))
+        self._transform = trans * \
+            (rotinv * (invert * (rot * (trans.inv() * self._transform))))
         self._update({'transformation': self._transform})
 
     def shear(self, shear, angle=0):
@@ -2765,20 +3061,21 @@ class Drawable(_EventTrigger):
 
         angle      clockwise angle for shear
         """
-        if not isinstance(shear, (int,float)):
+        if not isinstance(shear, (int, float)):
             raise TypeError('shear factor must be numeric')
-        if not isinstance(angle, (int,float)):
+        if not isinstance(angle, (int, float)):
             raise TypeError('angle must be numeric')
 
-        angle = _math.pi*angle/180.
+        angle = _math.pi * angle / 180.
         p = self._localToGlobal(self._reference)
-        trans = _Transformation((1.,0.,0.,1.)+p.get())
-        rot = _Transformation((_math.cos(angle),_math.sin(angle),
-                               -_math.sin(angle),_math.cos(angle),0.,0.))
+        trans = _Transformation((1., 0., 0., 1.) + p.get())
+        rot = _Transformation((_math.cos(angle), _math.sin(angle),
+                               -_math.sin(angle), _math.cos(angle), 0., 0.))
         rotinv = rot.inv()
-        sh = _Transformation((1.,-shear,0.,1.,0.,0.))
+        sh = _Transformation((1., -shear, 0., 1., 0., 0.))
 
-        self._transform = trans*(rotinv*(sh*(rot*(trans.inv()*self._transform))))
+        self._transform = trans * \
+            (rotinv * (sh * (rot * (trans.inv() * self._transform))))
         self._update({'transformation': self._transform})
 
     def getReferencePoint(self):
@@ -2793,12 +3090,12 @@ class Drawable(_EventTrigger):
 
         Note that the object is not moved at all.
         """
-        if not isinstance(dx, (int,float)):
+        if not isinstance(dx, (int, float)):
             raise TypeError('dx must be numeric')
-        if not isinstance(dy, (int,float)):
+        if not isinstance(dy, (int, float)):
             raise TypeError('dy must be numeric')
         p = self._localToGlobal(self._reference)
-        p = Point(p.getX()+dx, p.getY()+dy)
+        p = Point(p.getX() + dx, p.getY() + dy)
         self._reference = self._globalToLocal(p)
 
     def setDepth(self, depth):
@@ -2806,7 +3103,7 @@ class Drawable(_EventTrigger):
 
         Objects with a higher depth will be rendered behind those with lower depths.
         """
-        if not isinstance(depth, (int,float)):
+        if not isinstance(depth, (int, float)):
             raise TypeError('depth must be numeric')
         self._depth = depth
         self._update({'depth': self._depth})
@@ -2822,7 +3119,7 @@ class Drawable(_EventTrigger):
         including the sharing of color instances, but the new instance
         is not automatically added to those canvases or layers
         containing the original.
-        
+
         """
         return _copy.deepcopy(self)
 
@@ -2846,11 +3143,13 @@ class Drawable(_EventTrigger):
 
     def _objectChanged(self):
         """Deprecated"""
-        raise NotImplementedError('Deprecated.  Please see documentation for _contentsChanged()')
+        raise NotImplementedError(
+            'Deprecated.  Please see documentation for _contentsChanged()')
 
     def _draw(self):
         """Cause the object to be drawn (typically, the method is not called directly)."""
-        raise NotImplementedError('_draw() method must be implemented for each Drawable')
+        raise NotImplementedError(
+            '_draw() method must be implemented for each Drawable')
 
     def _contentsChanged(self):
         """Designates that the composition of a (user-defined) Drawable may have changed.
@@ -2862,16 +3161,18 @@ class Drawable(_EventTrigger):
         """
         cacheParent = _graphicsManager._drawParent
         cacheChildren = _graphicsManager._drawChildren
-        _graphicsManager._drawParent = (self, self.__class__)    # hopefully this is the correct class
+        # hopefully this is the correct class
+        _graphicsManager._drawParent = (self, self.__class__)
         _graphicsManager._drawChildren = []
 
         # important that we call _internalDraw, not _draw
-        self._internalDraw()       
-        _graphicsManager._frontHierarchy.reviseChildren(self, _graphicsManager._drawChildren)
+        self._internalDraw()
+        _graphicsManager._frontHierarchy.reviseChildren(
+            self, _graphicsManager._drawChildren)
 
         _graphicsManager._drawParent = cacheParent
         _graphicsManager._drawChildren = cacheChildren
-        
+
     def _update(self, properties):
         if self in _graphicsManager._frontHierarchy:
             _graphicsManager.beginRefresh()
@@ -2879,9 +3180,11 @@ class Drawable(_EventTrigger):
             _graphicsManager.completeRefresh()
 
     def _getProperties(self):
-        return {'transformation': self._transform, 'depth': self._depth, 'frozen' : self._frozen}
+        return {'transformation': self._transform, 'depth': self._depth, 'frozen': self._frozen}
+
 
 class Shape(Drawable):
+
     """A drawable objects that has a border."""
 
     def __init__(self, reference=None):
@@ -2892,18 +3195,20 @@ class Shape(Drawable):
         """
         if reference is not None and not isinstance(reference, Point):
             raise TypeError('reference point must be a Point instance')
-        Drawable.__init__(self, reference)
+        super(Shape, self).__init__()
+        if reference is not None:
+            self.moveTo(reference.getX(), reference.getY())
         self._borderColor = Color('Black')
         self._borderColor._register(self, 'border color')
         self._borderWidth = 1
-        self._dash = (1,0)        # solid line
+        self._dash = (1, 0)        # solid line
 
     def __deepcopy__(self, memo={}):
         temp = Drawable.__deepcopy__(self, memo)
         temp._borderColor = self._borderColor     # do shallow copy
         temp._borderColor._register(temp, 'border color')
         return temp
- 
+
     def setBorderColor(self, color):
         """
         Set the border color to a copy of the indicated color.
@@ -2924,7 +3229,7 @@ class Shape(Drawable):
                     raise
             old._unregister(self, 'border color')
             self._borderColor._register(self, 'border color')
-            self._update({'border color' : self._borderColor})
+            self._update({'border color': self._borderColor})
 
     def getBorderColor(self):
         """Return the color of the object's border."""
@@ -2932,7 +3237,7 @@ class Shape(Drawable):
 
     def setBorderWidth(self, width):
         """Set the width of the border to the indicated width."""
-        if not isinstance(width, (int,float)):
+        if not isinstance(width, (int, float)):
             raise TypeError('border width must be non-negative number')
         if width < 0:
             raise ValueError('border width cannot be negative')
@@ -2958,29 +3263,28 @@ class Shape(Drawable):
 
         Note: some systems do not properly support dashes with borderWidth greater than 1.
         """
-        if not isinstance(dashLength, (int,float)):
+        if not isinstance(dashLength, (int, float)):
             raise TypeError('dash Length must be numeric')
         if dashLength <= 0:
             raise ValueError('dash Length must be positive')
         if gapLength is None:
             gapLength = dashLength
-        if not isinstance(gapLength, (int,float)):
+        if not isinstance(gapLength, (int, float)):
             raise TypeError('space Length must be numeric')
         if gapLength < 0:
             raise ValueError('space Length must be non-negative')
         self._dash = (dashLength, gapLength)
-        self._update({'dash' : self._dash})
+        self._update({'dash': self._dash})
 
     def _getProperties(self):
-        prop = Drawable._getProperties(self)
-        prop.update({'border width' : self._borderWidth, 'border color' : Color(self._borderColor),
-                     'dash' : self._dash})
+        prop = super(Shape, self)._getProperties()
+        prop.update({'border width': self._borderWidth, 'border color': Color(self._borderColor),
+                     'dash': self._dash})
         return prop
 
-    # putting this at Shape rather than Drawable to avoid stubbing user-defined drawables
-    def _draw(self): pass
 
 class FillableShape(Shape):
+
     """A shape that can be filled with an interior color."""
 
     def __init__(self, reference=None):
@@ -2994,7 +3298,9 @@ class FillableShape(Shape):
         """
         if reference is not None and not isinstance(reference, Point):
             raise TypeError('reference point must be a Point instance')
-        Shape.__init__(self, reference)
+        super(FillableShape, self).__init__()
+        if reference is not None:
+            self.moveTo(reference.getX(), reference.getY())
         self._fillColor = Color('Transparent')
         self._fillColor._register(self, 'fill color')
 
@@ -3003,7 +3309,7 @@ class FillableShape(Shape):
         temp._fillColor = self._fillColor     # do shallow copy
         temp._fillColor._register(temp, 'fill color')
         return temp
- 
+
     def setFillColor(self, color):
         """Set the interior color of the shape to the color.
 
@@ -3032,12 +3338,15 @@ class FillableShape(Shape):
         return self._fillColor
 
     def _getProperties(self):
-        prop = Shape._getProperties(self)
+        prop = super(FillableShape, self)._getProperties()
         prop['fill color'] = Color(self._fillColor)
         return prop
 
 # Canvas class
+
+
 class Canvas(_GraphicsContainer, _EventTrigger):
+
     """A window that can be drawn upon."""
 
     def __init__(self, w=200, h=200, bgColor=None, title='Graphics canvas', autoRefresh=True):
@@ -3051,15 +3360,14 @@ class Canvas(_GraphicsContainer, _EventTrigger):
             autoRefresh   whether auto-refresh mode is used (default True)
 
         """
-        _GraphicsContainer.__init__(self)
-        _EventTrigger.__init__(self)
+        super(Canvas, self).__init__()
 
         if not bgColor:
             bgColor = 'white'
 
-        if not isinstance(w, (int,float)):
+        if not isinstance(w, (int, float)):
             raise TypeError('width must be numeric')
-        if not isinstance(h, (int,float)):
+        if not isinstance(h, (int, float)):
             raise TypeError('height must be numeric')
         if not isinstance(title, basestring):
             raise TypeError('title must be a string')
@@ -3071,7 +3379,7 @@ class Canvas(_GraphicsContainer, _EventTrigger):
         else:
             try:
                 self._backgroundColor = Color(bgColor)
-            except (TypeError,ValueError):
+            except (TypeError, ValueError):
                 raise
         if Color(self._backgroundColor) == Color('transparent'):
             raise ValueError('canvas background cannot be transparent')
@@ -3080,19 +3388,21 @@ class Canvas(_GraphicsContainer, _EventTrigger):
         if not _mathMode:
             self._transform = _Transformation()
         else:
-            self._transform = _Transformation((1,0,0,-1,0,h))
+            self._transform = _Transformation((1, 0, 0, -1, 0, h))
         self._width = w
         self._height = h
         self._title = title
         self._canvasOpen = True
-        self._mouseCoordinates = Point(0,0)
+        self._mouseCoordinates = Point(0, 0)
         self._animation = None
-        self._frozen = False     # want initial rendering with title/size/color even if not autoRefresh
+        # want initial rendering with title/size/color even if not autoRefresh
+        self._frozen = False
         self._reference = Point()  # TODO: hack because of use in getting event coordinates
         _graphicsManager._openCanvases.append(self)
         _graphicsManager._frontHierarchy.newCanvas(self)
         _graphicsManager.beginRefresh()
-        _graphicsManager.addCommandToQueue(('create canvas', self, self._getProperties()))
+        _graphicsManager.addCommandToQueue(
+            ('create canvas', self, self._getProperties()))
         _graphicsManager.completeRefresh()
         if not autoRefresh:                # turn off auto-refresh before continuing
             self.setAutoRefresh(False)
@@ -3100,7 +3410,7 @@ class Canvas(_GraphicsContainer, _EventTrigger):
     # TODO: get rid of this. temporary hack for 3.0 issue and comparing chains
     def __lt__(self, other):
         return id(self) < id(other)
-            
+
     def _update(self, properties):
         _graphicsManager.beginRefresh()
         _graphicsManager.addCommandToQueue(('update', self, properties))
@@ -3108,9 +3418,9 @@ class Canvas(_GraphicsContainer, _EventTrigger):
 
     def _getProperties(self):
         # Note: using depth of (0,id(self)) to ensure uniqueness among canvases
-        return { 'width': self._width, 'height': self._height, 'background color': Color(self._backgroundColor),
-                 'title': self._title, 'transformation': self._transform, 'depth': (0,id(self)),
-                 'frozen' : self._frozen }
+        return {'width': self._width, 'height': self._height, 'background color': Color(self._backgroundColor),
+                'title': self._title, 'transformation': self._transform, 'depth': (0, id(self)),
+                'frozen': self._frozen}
 
     def getAutoRefresh(self):
         """Queries current state of the auto-refresh mode.
@@ -3125,7 +3435,7 @@ class Canvas(_GraphicsContainer, _EventTrigger):
             # force a flush and then re-freeeze
             self.setAutoRefresh(True)
             self.setAutoRefresh(False)
-        
+
     def setAutoRefresh(self, autoRefresh=True):
         """Change the auto-refresh mode.
 
@@ -3171,7 +3481,7 @@ class Canvas(_GraphicsContainer, _EventTrigger):
                     raise
             oldColor._unregister(self, 'background color')
             self._backgroundColor._register(self, 'background color')
-            self._update({'background color' : Color(self._backgroundColor)})
+            self._update({'background color': Color(self._backgroundColor)})
 
     def getBackgroundColor(self):
         """Return the background color as a Color instance."""
@@ -3179,12 +3489,12 @@ class Canvas(_GraphicsContainer, _EventTrigger):
 
     def setWidth(self, w):
         """Reset the canvas width to w."""
-        if not isinstance(w, (int,float)):
+        if not isinstance(w, (int, float)):
             raise TypeError('width must be numeric value')
         if w <= 0:
             raise ValueError('width must be positive')
         self._width = w
-        self._update( {'width' : w } )
+        self._update({'width': w})
 
     def getWidth(self):
         """Return the width of the canvas."""
@@ -3192,7 +3502,7 @@ class Canvas(_GraphicsContainer, _EventTrigger):
 
     def setHeight(self, h):
         """Reset the canvas height to h."""
-        if not isinstance(h, (int,float)):
+        if not isinstance(h, (int, float)):
             raise TypeError('height must be numeric value')
         if h <= 0:
             raise ValueError('height must be positive')
@@ -3200,11 +3510,12 @@ class Canvas(_GraphicsContainer, _EventTrigger):
         if _mathMode:
             delta = self._height - h
             self._height = h
-            self._transform = self._transform * _Transformation( (1,0,0,1,0,delta) )
-            self._update( {'height' : h , 'transformation' : self._transform} )
+            self._transform = self._transform * \
+                _Transformation((1, 0, 0, 1, 0, delta))
+            self._update({'height': h, 'transformation': self._transform})
         else:
             self._height = h
-            self._update( {'height' : h } )
+            self._update({'height': h})
 
     def getHeight(self):
         """Return the height of the canvas."""
@@ -3215,7 +3526,7 @@ class Canvas(_GraphicsContainer, _EventTrigger):
         if not isinstance(title, basestring):
             raise TypeError('title must be a string')
         self._title = title
-        self._update( {'title' : title } )
+        self._update({'title': title})
 
     def getTitle(self):
         """Return the title of the window."""
@@ -3227,7 +3538,7 @@ class Canvas(_GraphicsContainer, _EventTrigger):
         The window can be closed with a subsequent call to close().
         """
         if not self._canvasOpen:
-            self._update( {'visible' : True } )
+            self._update({'visible': True})
             self._canvasOpen = True
             _graphicsManager._openCanvases.append(self)
 
@@ -3237,9 +3548,15 @@ class Canvas(_GraphicsContainer, _EventTrigger):
         The window can be reopened with a subsequent call to open().
         """
         if self._canvasOpen:
-            self._update( {'visible' : False } )
+            self._update({'visible': False})
             self._canvasOpen = False
             _graphicsManager._openCanvases.remove(self)
+            _graphicsManager._eventHandlers.pop(self, None)
+            _graphicsManager._periodicHandlers.pop(self, None)
+
+    def _forceClose(self):
+        self.setAutoRefresh(True)
+        self.close()
 
     def add(self, drawable):
         """Add the Drawable object to the canvas."""
@@ -3248,20 +3565,24 @@ class Canvas(_GraphicsContainer, _EventTrigger):
         if drawable in self._contents:
             raise ValueError('object already on the Canvas')
         if '_transform' not in vars(drawable):
-            raise Exception('Drawable instance not properly initialized (was parent constructor called?)')
+            raise Exception(
+                'Drawable instance not properly initialized (was parent constructor called?)')
         try:
             drawable._draw
         except AttributeError:
-            raise Exception('child class of Drawable must provide a _draw method')
+            raise Exception(
+                'child class of Drawable must provide a _draw method')
 
-        if _debug >= 1: print('\nCall to Canvas.add with self='+str(self)+' drawable='+str(drawable))
+        if _DEBUG['Front'] >= 1:
+            print('\nCall to Canvas.add with self=' +
+                  str(self) + ' drawable=' + str(drawable))
         _GraphicsContainer.add(self, drawable)
-        
+
     def remove(self, drawable):
         """Remove the drawable object from the canvas."""
         if drawable not in self._contents:
-          raise ValueError('Object not currently on the Canvas')
-        _GraphicsContainer.remove(self,drawable)
+            raise ValueError('Object not currently on the Canvas')
+        _GraphicsContainer.remove(self, drawable)
 
     def setView(self, lowerLeft, upperRight):
         """Set the coordinates for the lower-left corner and upper-right corners of the canvas.
@@ -3271,15 +3592,19 @@ class Canvas(_GraphicsContainer, _EventTrigger):
         if not isinstance(lowerLeft, Point) or not isinstance(upperRight, Point):
             raise TypeError('lowerLeft and upperRight must be Point instances')
         if lowerLeft.getX() == upperRight.getX() or lowerLeft.getY() == upperRight.getY():
-            raise ValueError('Lower left and upper right corners must have different x and y coordinates.')
+            raise ValueError(
+                'Lower left and upper right corners must have different x and y coordinates.')
 
-        xScale = float(self.getWidth())/(upperRight.getX()-lowerLeft.getX())
-        yScale = -float(self.getHeight())/(upperRight.getY()-lowerLeft.getY())
-        xTrans = -xScale*lowerLeft.getX()
-        yTrans = self.getHeight() - yScale*lowerLeft.getY()
+        xScale = float(self.getWidth()) / \
+            (upperRight.getX() - lowerLeft.getX())
+        yScale = -float(self.getHeight()) / \
+            (upperRight.getY() - lowerLeft.getY())
+        xTrans = -xScale * lowerLeft.getX()
+        yTrans = self.getHeight() - yScale * lowerLeft.getY()
 
-        self._transform = _Transformation( (xScale,0,0,yScale,xTrans,yTrans) )
-        self._update( {'transformation' : self._transform} )
+        self._transform = _Transformation(
+            (xScale, 0, 0, yScale, xTrans, yTrans))
+        self._update({'transformation': self._transform})
 
     def zoomView(self, factor, fixedPoint=None):
         """Scales the coordinate system for the canvas about the given fixed point.
@@ -3289,20 +3614,22 @@ class Canvas(_GraphicsContainer, _EventTrigger):
                     (default center of current view)
 
         """
-        if not isinstance(factor, (int,float)):
+        if not isinstance(factor, (int, float)):
             raise TypeError('zoom factor must be a positive number')
         if factor <= 0:
             raise ValueError('zoom factor must be a positive number')
         if fixedPoint is not None:
             if not isinstance(fixedPoint, Point):
-                raise TypeError('fixedPoint must be specified as a Point instance')
+                raise TypeError(
+                    'fixedPoint must be specified as a Point instance')
         else:
-            fixedPoint = self._transform.inv().image(Point(self.getWidth()/2., self.getHeight()/2.))
+            fixedPoint = self._transform.inv().image(
+                Point(self.getWidth() / 2., self.getHeight() / 2.))
 
-        self._transform = self._transform * _Transformation( (factor,0,0,factor,
-            fixedPoint.getX() * (1-factor), fixedPoint.getY()*(1-factor)))
+        self._transform = self._transform * _Transformation((factor, 0, 0, factor,
+                                                             fixedPoint.getX() * (1 - factor), fixedPoint.getY() * (1 - factor)))
 
-        self._update( {'transformation' : self._transform} )
+        self._update({'transformation': self._transform})
 
     def rotateView(self, angle, fixedPoint=None):
         """Rotates the coordinate system of the canvas about the given fixed point.
@@ -3312,22 +3639,24 @@ class Canvas(_GraphicsContainer, _EventTrigger):
                     (default center of current view)
 
         """
-        if not isinstance(angle, (int,float)):
+        if not isinstance(angle, (int, float)):
             raise TypeError('angle must be numeric')
         if fixedPoint is None:
-            fixedPoint = self._transform.inv().image(Point(self.getWidth()/2., self.getHeight()/2.))
+            fixedPoint = self._transform.inv().image(
+                Point(self.getWidth() / 2., self.getHeight() / 2.))
         if not isinstance(fixedPoint, Point):
             raise TypeError('fixedPoint must be specified as a Point instance')
 
         if not isinstance(fixedPoint, Point):
             raise TypeError('fixedPoint must be specified as a Point instance')
 
-        translation = _Transformation( (1,0,0,1,fixedPoint.getX(),fixedPoint.getY()) )
-        angle = -_math.pi*angle/180.
-        rot = _Transformation((_math.cos(angle),_math.sin(angle),
-                               -_math.sin(angle),_math.cos(angle),0.,0.))
+        translation = _Transformation(
+            (1, 0, 0, 1, fixedPoint.getX(), fixedPoint.getY()))
+        angle = -_math.pi * angle / 180.
+        rot = _Transformation((_math.cos(angle), _math.sin(angle),
+                               -_math.sin(angle), _math.cos(angle), 0., 0.))
         self._transform = self._transform * translation * rot * translation.inv()
-        self._update( {'transformation' : self._transform} )
+        self._update({'transformation': self._transform})
 
     def translateView(self, lowerLeft):
         """Translates the viewable portion of the canvas's coordinate system.
@@ -3338,17 +3667,17 @@ class Canvas(_GraphicsContainer, _EventTrigger):
         if not isinstance(lowerLeft, Point):
             raise TypeError('lowerLeft must be specified as a Point instance')
 
-        delta = self._transform.inv().image(Point(0,self.getHeight())) + (-1)*lowerLeft
-        translation = _Transformation( (1,0,0,1,delta.getX(),delta.getY()) )
+        delta = self._transform.inv().image(Point(0, self.getHeight())) + (-1) * lowerLeft
+        translation = _Transformation((1, 0, 0, 1, delta.getX(), delta.getY()))
         self._transform = self._transform * translation
-        self._update( {'transformation' : self._transform} )
+        self._update({'transformation': self._transform})
 
     def saveToFile(self, filename):
         """Save a picture of the current canvas to a file.
 
         The filename extension must be a supported file type.
         The standard extentions are either .eps or .ps.
-        
+
         If the Python Imaging Library is installed then addition
         supported file types are: .gif, .jpg, .jpeg, .png
         """
@@ -3362,32 +3691,71 @@ class Canvas(_GraphicsContainer, _EventTrigger):
         else:
             choices = ('eps', 'ps', 'gif', 'jpg', 'jpeg', 'png')
         if ext not in choices:
-            raise ValueError('Unsupported file type. Choices: ' + ' '.join(choices))
+            raise ValueError(
+                'Unsupported file type. Choices: ' + ' '.join(choices))
 
-        if ext in ('eps','ps'):
+        if ext in ('eps', 'ps'):
             epsFilename = filename
         else:
             fd, epsFilename = _tempfile.mkstemp('.eps')
             _os.close(fd)
-        
-        _graphicsManager.executeFunction( ('save to file', self, epsFilename,
-                                           self.getBackgroundColor()) )
 
-        if ext not in ('eps','ps'):  # Use PIL to convert
+        _graphicsManager.executeFunction(('save to file', self, epsFilename,
+                                          self.getBackgroundColor()))
+
+        if ext not in ('eps', 'ps'):  # Use PIL to convert
             image = _Image.open(epsFilename).convert('RGBA')
             image.save(filename)
             _os.remove(epsFilename)
-            
+
+    def saveToIO(self, bio, ext='eps'):
+        """Save a picture of the current canvas to a file.
+
+        The filename extension must be a supported file type.
+        The standard extentions are either .eps or .ps.
+
+        If the Python Imaging Library is installed then addition
+        supported file types are: .gif, .jpg, .jpeg, .png
+        """
+        if not isinstance(bio, _io.BytesIO):
+            raise TypeError('bio must be a BytesIO')
+        if not _pilAvailable:
+            choices = ('eps', 'ps')
+        else:
+            choices = ('eps', 'ps', 'gif', 'jpg', 'jpeg', 'png')
+        if ext not in choices:
+            raise ValueError(
+                'Unsupported file type. Choices: ' + ' '.join(choices))
+
+        _graphicsManager.executeFunction(('save to io', self, bio,
+                                          self.getBackgroundColor()))
+        bio.seek(0)
+
+        if ext not in ('eps', 'ps'):  # Use PIL to convert
+            image = _Image.open(bio).convert('RGBA')
+            bio.truncate(0)
+            bio.seek(0)
+            image.save(bio, format=ext)
+
     def getMouseCoordinates(self):
         """Return the current coordinate of the mouse."""
         return self._mouseCoordinates
 
+    def addPeriodicHandler(self, interval, handler):
+        _graphicsManager.addPeriodicHandler(self, interval, handler)
+
+    def removePeriodicHandler(self, interval, handler):
+        _graphicsManager.removePeriodicHandler(self, interval, handler)
+
+
 class _RenderedCanvas(object):
+
     def __init__(self, chain, properties):
-        if _debug >= 1: print('Creating _RenderedCanvas')
+        if _DEBUG['Tkinter'] >= 1:
+            print('Tkinter making rendered canvas')
         self._parent = chain[-1][0]
         self._tkWin = _Tkinter.Toplevel()
-        self._tkWin.protocol('WM_DELETE_WINDOW', self._parent.close)
+        self._tkWin.protocol('WM_DELETE_WINDOW', self._parent._forceClose)
         self._tkWin.title(properties['title'])
         self._w = properties['width']
         self._h = properties['height']
@@ -3395,10 +3763,12 @@ class _RenderedCanvas(object):
                                        highlightthickness=0,
                                        background=Color._getTkColor(properties['background color']))
         self._canvas.pack(expand=False, side=_Tkinter.TOP)
-        self._tkWin.resizable(0,0)
-        
+        self._tkWin.resizable(0, 0)
+
         # Setup function to deal with events
-        callback = lambda event : self._handleEvent(event)
+        # Is this getting called? Seems suspcious
+        # Essentially makes a function on the fly
+        def callback(event): return self._handleEvent(event)
         self._canvas.bind('<Button>', callback)
         self._canvas.bind('<ButtonRelease>', callback)
         self._canvas.bind('<Key>', callback)
@@ -3416,7 +3786,8 @@ class _RenderedCanvas(object):
             self._h = properties['height']
             self._canvas.config(height=self._h)
         if 'background color' in properties:
-            self._canvas.config(background=Color._getTkColor(properties['background color']))
+            self._canvas.config(background=Color._getTkColor(
+                properties['background color']))
         if 'visible' in properties:
             if not properties['visible']:
                 self._tkWin.withdraw()
@@ -3425,8 +3796,8 @@ class _RenderedCanvas(object):
 
     def saveToFile(self, filename, bgcolor):
         # add rectangle to simulate background color
-        fakeBG = self._canvas.create_polygon((0,0), (self._w,0), (self._w,self._h), (0,self._h),
-                                             fill=Color._getTkColor(bgcolor),outline='')
+        fakeBG = self._canvas.create_polygon((0, 0), (self._w, 0), (self._w, self._h), (0, self._h),
+                                             fill=Color._getTkColor(bgcolor), outline='')
         self._canvas.lower(fakeBG)
         try:
             self._canvas.postscript(file=filename)
@@ -3435,21 +3806,39 @@ class _RenderedCanvas(object):
         except:
             pass
         self._canvas.delete(fakeBG)
-        
+
+    def saveToIO(self, bio, bgcolor):
+        # add rectangle to simulate background color
+        fakeBG = self._canvas.create_polygon((0, 0), (self._w, 0), (self._w, self._h), (0, self._h),
+                                             fill=Color._getTkColor(bgcolor), outline='')
+        self._canvas.lower(fakeBG)
+        try:
+            bio.write(self._canvas.postscript().encode('utf-8'))
+        except KeyboardInterrupt:
+            raise
+        except:
+            pass
+        self._canvas.delete(fakeBG)
+
     def _handleEvent(self, event):
+        if _DEBUG['Events'] >= 1 and int(event.type) == 4:
+            print('The following is the currentThread in _handleEvent')
+            print(_threading.currentThread())
+            # This will get run repeatedly with mouseover
         # Create the event
         e = Event()
         if not _graphicsManager._mousePrevPosition:
             e._prevx, e._prevy = event.x, event.y
         else:
-            e._prevx, e._prevy = _graphicsManager._mousePrevPosition[0], _graphicsManager._mousePrevPosition[1]
+            e._prevx, e._prevy = _graphicsManager._mousePrevPosition[
+                0], _graphicsManager._mousePrevPosition[1]
         _graphicsManager._mousePrevPosition = (int(event.x), int(event.y))
         e._x, e._y = event.x, event.y
-        
+
         # Set the mouse coordinates
         # TODO must deal with tranformations for top level on all coordinates
         self._parent._mouseCoordinates = Point(e._x, e._y)
-        
+
         if int(event.type) == 2:   # Keypress
             e._eventType = 'keyboard'
             if event.char:
@@ -3463,47 +3852,58 @@ class _RenderedCanvas(object):
                     e._key = '\t'
                 else:
                     return  # ignore this event.
-        elif int(event.type) == 4: # Mouse click
+        elif int(event.type) == 4:  # Mouse click
             e._eventType = 'mouse click'
             e._button = event.num
             _graphicsManager._mouseButtonDown = True
-        elif int(event.type) == 5: # Mouse release
+        elif int(event.type) == 5:  # Mouse release
             e._eventType = 'mouse release'
             e._button = event.num
             _graphicsManager._mouseButtonDown = False
-        elif int(event.type) == 6: # Mouse move
+        elif int(event.type) == 6:  # Mouse move
             self._canvas._mouseCoordinates = Point(e._x, e._y)
             if _graphicsManager._mouseButtonDown:
                 e._eventType = 'mouse drag'
             else:
                 return
         else:
-            return       
-          
-          
-        # Find the shape where the event occurred:
-        tkIds = self._canvas.find_overlapping(event.x, event.y, event.x, event.y)
-        if len(tkIds) > 0:
-            chain = _graphicsManager._objectIdRegistry[(self._canvas, tkIds[-1])]._chain
-        else:          
-            chain = ((self._parent,Canvas),)
+            return
 
-        for i in range(len(chain),0,-1):
+        # Find the shape where the event occurred:
+        tkIds = self._canvas.find_overlapping(
+            event.x, event.y, event.x, event.y)
+        if len(tkIds) > 0:
+            chain = _graphicsManager._objectIdRegistry[(
+                self._canvas, tkIds[-1])]._chain
+        else:
+            chain = ((self._parent, Canvas),)
+
+        handlers = {}   # map from handler to defining (subchain,trigger)
+        for i in range(len(chain), 0, -1):
             subchain = chain[:i]
+            for h in _graphicsManager._eventHandlers.get(subchain[-1][0], set()):
+                # don't overwrite higher-level chains
+                handlers.setdefault(h, subchain)
+        for (h, subchain) in handlers.items():
             e._trigger = subchain[-1][0]
-            for h in _graphicsManager._eventHandlers.get(e._trigger,set()):
-                transformedEvent = _copy.copy(e)
-                cumInv = _graphicsManager._renderedHierarchy.getNode(subchain)._cumulativeTransformation.inv()
-                local = _graphicsManager._renderedHierarchy.getNode(subchain)._transformation
-                trans = local.image(e._trigger._reference)  # TODO make property; not thread safe
-                p = local.image(cumInv.image(Point(e._x, e._y)))
-                transformedEvent._x = p._x - trans._x
-                transformedEvent._y = p._y - trans._y
-                _graphicsManager.addEventToQueue(h, transformedEvent)
+            transformedEvent = _copy.copy(e)
+            # QUESTION: does this work when object has nested chains because of nested _draw with inheritance?
+            cumInv = _graphicsManager._renderedHierarchy.getNode(
+                subchain)._cumulativeTransformation.inv()
+            local = _graphicsManager._renderedHierarchy.getNode(
+                subchain)._transformation
+            # TODO make property; not thread safe
+            trans = local.image(e._trigger._reference)
+            p = local.image(cumInv.image(Point(e._x, e._y)))
+            transformedEvent._x = p._x - trans._x
+            transformedEvent._y = p._y - trans._y
+            # Something should be checking queue to pull stuff and process
+            _graphicsManager.addEventToQueue(h, transformedEvent)
 
 
 # Layer class
 class Layer(Drawable, _GraphicsContainer):
+
     """A composite that represents a group of shapes as a single drawable object.
 
     Objects are placed onto the layer relative to the coordinate
@@ -3511,6 +3911,7 @@ class Layer(Drawable, _GraphicsContainer):
     canvas (or even onto another layer).
 
     """
+
     def __init__(self):
         """Construct a new Layer instance.
 
@@ -3520,8 +3921,7 @@ class Layer(Drawable, _GraphicsContainer):
         its own coordinate system, (0,0).
 
         """
-        Drawable.__init__(self)
-        _GraphicsContainer.__init__(self)
+        super(Layer, self).__init__()
         self._final = False
 
     def finalize(self):
@@ -3531,18 +3931,22 @@ class Layer(Drawable, _GraphicsContainer):
 
         """
         self._final = True
-        
+
     def add(self, drawable):
         """Add the Drawable object to the layer."""
-        if _debug >= 1: print('\nCall to Layer.add with self='+str(self)+' drawable='+str(drawable))
+        if _DEBUG['Front'] >= 1:
+            print('\nCall to Layer.add with self=' +
+                  str(self) + ' drawable=' + str(drawable))
         if self._final:
             raise Exception('cannot add objects once finalized')
         if not isinstance(drawable, Drawable):
-            raise TypeError('parameter must be an instance of a Drawable object')
+            raise TypeError(
+                'parameter must be an instance of a Drawable object')
         if drawable in self._contents:
             raise ValueError('object is already on the Layer')
         if '_transform' not in vars(drawable):
-            raise Exception('Drawable not properly initialized (was parent constructor called?)')
+            raise Exception(
+                'Drawable not properly initialized (was parent constructor called?)')
         try:
             drawable._draw
         except KeyboardInterrupt:
@@ -3563,7 +3967,7 @@ class Layer(Drawable, _GraphicsContainer):
         if drawable not in self._contents:
             raise ValueError('object not currently on the Layer')
 
-        _GraphicsContainer.remove(self,drawable)
+        _GraphicsContainer.remove(self, drawable)
 
     def clear(self):
         """Remove all objects from the layer."""
@@ -3577,7 +3981,9 @@ class Layer(Drawable, _GraphicsContainer):
 
 
 class Circle(FillableShape):
+
     """A circle that can be drawn to a canvas."""
+
     def __init__(self, radius=10, centerPt=None):
         """Construct a new instance of Circle.
 
@@ -3588,38 +3994,46 @@ class Circle(FillableShape):
         The reference point for a circle is originally its center.
 
         """
-        if not isinstance(radius, (int,float)):
+        if not isinstance(radius, (int, float)):
             raise TypeError('radius must be numeric')
         if radius <= 0:
             raise ValueError("radius must be positive")
         if centerPt and not isinstance(centerPt, Point):
             raise TypeError("circle's center must be specified as a Point")
 
-        FillableShape.__init__(self)
+        super(Circle, self).__init__()
         if not centerPt:
             centerPt = Point()
         oldBorderWidth = self.getBorderWidth()
-        self._transform = _Transformation( (radius,0.,0.,radius,centerPt.getX(),centerPt.getY()) )
+        self._transform = _Transformation(
+            (radius, 0., 0., radius, centerPt.getX(), centerPt.getY()))
         self._borderWidth = oldBorderWidth / self._transform.scale()
 
     def setRadius(self, r):
         """Set the radius of the circle to r."""
-        if not isinstance(r, (int,float)):
+        if not isinstance(r, (int, float)):
             raise TypeError('radius must be numeric')
         if r <= 0:
             raise ValueError("radius must be positive")
 
-        factor = float(r)/self.getRadius()
+        factor = float(r) / self.getRadius()
         oldBorderWidth = self.getBorderWidth()
-        self._transform = self._transform * _Transformation((factor,0.,0.,factor,0.,0.))
+        self._transform = self._transform * \
+            _Transformation((factor, 0., 0., factor, 0., 0.))
         self._borderWidth = oldBorderWidth / self._transform.scale()
-        self._update({'transformation': self._transform, 'border width': self._borderWidth})
+        self._update({'transformation': self._transform,
+                     'border width': self._borderWidth})
 
     def getRadius(self):
         """Return the radius of the circle."""
-        return _math.sqrt(self._transform._matrix[0]**2 + self._transform._matrix[1]**2)
+        return _math.sqrt(self._transform._matrix[0] ** 2 + self._transform._matrix[1] ** 2)
+
+    def _draw(self):
+        pass        # required for our built-in concrete drawables
+
 
 class Ellipse(FillableShape):
+
     """A ellipse that can be drawn to a canvas."""
 
     def __init__(self, w=10, h=10, centerPt=None):
@@ -3633,59 +4047,69 @@ class Ellipse(FillableShape):
         The reference point for a ellipse is originally its center.
 
         """
-        if not isinstance(w, (int,float)):
+        if not isinstance(w, (int, float)):
             raise TypeError('width must be numeric')
         if w <= 0:
             raise ValueError('width must be positive')
-        if not isinstance(h, (int,float)):
+        if not isinstance(h, (int, float)):
             raise TypeError('height must be numeric')
         if h <= 0:
             raise ValueError('height must be positive')
         if centerPt and not isinstance(centerPt, Point):
             raise TypeError("center must be specified as a Point")
 
-        FillableShape.__init__(self) # intentionally not sending center
+        super(Ellipse, self).__init__()
         if not centerPt:
             centerPt = Point()
         oldBorderWidth = self.getBorderWidth()
-        self._transform = _Transformation( (.5*w, 0., 0., .5*h, centerPt.getX(), centerPt.getY()) )
+        self._transform = _Transformation(
+            (.5 * w, 0., 0., .5 * h, centerPt.getX(), centerPt.getY()))
         self._borderWidth = oldBorderWidth / self._transform.scale()
 
     def getWidth(self):
         """Return the width of the ellipse."""
-        return 2*_math.sqrt(self._transform._matrix[0]**2 + self._transform._matrix[2]**2)
+        return 2 * _math.sqrt(self._transform._matrix[0] ** 2 + self._transform._matrix[2] ** 2)
 
     def getHeight(self):
         """Return the height of the ellipse."""
-        return 2*_math.sqrt(self._transform._matrix[1]**2 + self._transform._matrix[3]**2)
+        return 2 * _math.sqrt(self._transform._matrix[1] ** 2 + self._transform._matrix[3] ** 2)
 
     def setWidth(self, w):
         """Set the width of the ellipse to w."""
-        if not isinstance(w, (int,float)):
+        if not isinstance(w, (int, float)):
             raise TypeError('width must be numeric')
         if w <= 0:
             raise ValueError("width must be positive")
 
-        factor = float(w)/self.getWidth()
+        factor = float(w) / self.getWidth()
         oldBorderWidth = self.getBorderWidth()
-        self._transform = self._transform * _Transformation((factor,0.,0.,1.,0.,0.))
+        self._transform = self._transform * \
+            _Transformation((factor, 0., 0., 1., 0., 0.))
         self._borderWidth = oldBorderWidth / self._transform.scale()
-        self._update({'transformation': self._transform, 'border width': self._borderWidth})
+        self._update({'transformation': self._transform,
+                     'border width': self._borderWidth})
 
     def setHeight(self, h):
         """Set the height of the ellipse to h."""
-        if not isinstance(h, (int,float)):
+        if not isinstance(h, (int, float)):
             raise TypeError('height must be numeric')
         if h <= 0:
             raise ValueError("height must be numeric")
 
-        factor = float(h)/self.getHeight()
+        factor = float(h) / self.getHeight()
         oldBorderWidth = self.getBorderWidth()
-        self._transform = self._transform * _Transformation((1.,0.,0.,factor,0.,0.))
+        self._transform = self._transform * \
+            _Transformation((1., 0., 0., factor, 0., 0.))
         self._borderWidth = oldBorderWidth / self._transform.scale()
-        self._update({'transformation': self._transform, 'border width': self._borderWidth})
+        self._update({'transformation': self._transform,
+                     'border width': self._borderWidth})
+
+    def _draw(self):
+        pass        # required for our built-in concrete drawables
+
 
 class Rectangle(FillableShape):
+
     """A rectangle that can be drawn to the canvas."""
 
     def __init__(self, w=20, h=10, centerPt=None):
@@ -3700,63 +4124,72 @@ class Rectangle(FillableShape):
                   (default Point(0,0) )
 
         """
-        if not isinstance(w, (int,float)):
+        if not isinstance(w, (int, float)):
             raise TypeError('width must be numericr')
         if w <= 0:
             raise ValueError('width must be positive')
-        if not isinstance(h, (int,float)):
+        if not isinstance(h, (int, float)):
             raise TypeError('height must be numeric')
         if h <= 0:
             raise ValueError('height must be positive')
         if centerPt and not isinstance(centerPt, Point):
             raise TypeError('center must be specified as a Point')
 
-        FillableShape.__init__(self)  # intentionally not sending center point
+        # intentionally not sending center point
+        super(Rectangle, self).__init__()
         if not centerPt:
-            centerPt = Point(0,0)
+            centerPt = Point(0, 0)
         oldBorderWidth = self.getBorderWidth()
-        self._transform = _Transformation( (w, 0., 0., h, centerPt.getX(), centerPt.getY()) )
+        self._transform = _Transformation(
+            (w, 0., 0., h, centerPt.getX(), centerPt.getY()))
         self._borderWidth = oldBorderWidth / self._transform.scale()
 
     def getWidth(self):
         """Return the width of the rectangle."""
-        return _math.sqrt(self._transform._matrix[0]**2 + self._transform._matrix[2]**2)
+        return _math.sqrt(self._transform._matrix[0] ** 2 + self._transform._matrix[2] ** 2)
 
     def getHeight(self):
         """Return the height of the rectangle."""
-        return _math.sqrt(self._transform._matrix[1]**2 + self._transform._matrix[3]**2)
+        return _math.sqrt(self._transform._matrix[1] ** 2 + self._transform._matrix[3] ** 2)
 
     def setWidth(self, w):
         """Set the width of the rectangle to w."""
-        if not isinstance(w, (int,float)):
+        if not isinstance(w, (int, float)):
             raise TypeError('width must be a positive number')
         if w <= 0:
             raise ValueError("width must be positive")
         factor = float(w) / self.getWidth()
         oldBorderWidth = self.getBorderWidth()
         p = self._localToGlobal(self._reference)
-        trans = _Transformation((1.,0.,0.,1.)+p.get())
-        sca = _Transformation((factor,0.,0.,1.,0.,0.))
-        self._transform = trans*(sca*(trans.inv()*self._transform))
+        trans = _Transformation((1., 0., 0., 1.) + p.get())
+        sca = _Transformation((factor, 0., 0., 1., 0., 0.))
+        self._transform = trans * (sca * (trans.inv() * self._transform))
         self._borderWidth = oldBorderWidth / self._transform.scale()
-        self._update({'transformation': self._transform, 'border width': self._borderWidth})
+        self._update({'transformation': self._transform,
+                     'border width': self._borderWidth})
 
     def setHeight(self, h):
         """Set the height of the rectangle to h."""
-        if not isinstance(h, (int,float)):
+        if not isinstance(h, (int, float)):
             raise TypeError('height must be a positive number')
         if h <= 0:
             raise ValueError("height must be positive")
         factor = float(h) / self.getHeight()
         oldBorderWidth = self.getBorderWidth()
         p = self._localToGlobal(self._reference)
-        trans = _Transformation((1.,0.,0.,1.)+p.get())
-        sca = _Transformation((1.,0.,0.,factor,0.,0.))
-        self._transform = trans*(sca*(trans.inv()*self._transform))
+        trans = _Transformation((1., 0., 0., 1.) + p.get())
+        sca = _Transformation((1., 0., 0., factor, 0., 0.))
+        self._transform = trans * (sca * (trans.inv() * self._transform))
         self._borderWidth = oldBorderWidth / self._transform.scale()
-        self._update({'transformation': self._transform, 'border width': self._borderWidth})
+        self._update({'transformation': self._transform,
+                     'border width': self._borderWidth})
+
+    def _draw(self):
+        pass        # required for our built-in concrete drawables
+
 
 class Square(Rectangle):
+
     """A square that can be drawn to the canvas."""
 
     def __init__(self, size=10, centerPt=None):
@@ -3770,14 +4203,17 @@ class Square(Rectangle):
                   (defaults Point(0,0) )
 
         """
-        if not isinstance(size, (int,float)):
+        if not isinstance(size, (int, float)):
             raise TypeError('size must be numeric')
         if size <= 0:
             raise ValueError('size must be positive')
         if centerPt and not isinstance(centerPt, Point):
             raise TypeError('center must be specified as a Point')
 
-        Rectangle.__init__(self, size, size, centerPt)
+        super(Square, self).__init__()
+        self.setSize(size)
+        if centerPt is not None:
+            self.moveTo(centerPt.getX(), centerPt.getY())
 
     def getSize(self):
         """Return the length of a side of the square."""
@@ -3785,7 +4221,7 @@ class Square(Rectangle):
 
     def setSize(self, s):
         """Set the width and height of the square to s."""
-        if not isinstance(s, (int,float)):
+        if not isinstance(s, (int, float)):
             raise TypeError('size must be numeric')
         if s <= 0:
             raise ValueError('size must be positive')
@@ -3796,7 +4232,7 @@ class Square(Rectangle):
 
     def setWidth(self, w):
         """Set the width and height of the square to w."""
-        if not isinstance(w, (int,float)):
+        if not isinstance(w, (int, float)):
             raise TypeError('width must be numeric')
         if w <= 0:
             raise ValueError("width must be positive")
@@ -3804,13 +4240,15 @@ class Square(Rectangle):
 
     def setHeight(self, h):
         """Set the width and height of the square to h."""
-        if not isinstance(h, (int,float)):
+        if not isinstance(h, (int, float)):
             raise TypeError('height must be numeric')
         if h <= 0:
             raise ValueError("height must be positive")
         self.setSize(h)
 
+
 class Path(Shape):
+
     """A path that can be drawn to a canvas."""
 
     def __init__(self, *points):
@@ -3827,7 +4265,7 @@ class Path(Shape):
         point of the path.
         """
 
-        Shape.__init__(self)
+        super(Path, self).__init__()
 
         if len(points) == 1:
             try:
@@ -3840,12 +4278,13 @@ class Path(Shape):
                 raise TypeError('non-Point specified as parameter')
         self._points = list(points)
         if len(self._points) >= 1:
-            self.adjustReference(self._points[0].getX(), self._points[0].getY())
+            self.adjustReference(
+                self._points[0].getX(), self._points[0].getY())
         self._final = False
-        self._arrows = (False,False)
+        self._arrows = (False, False)
 
     def _getProperties(self):
-        prop = Shape._getProperties(self)
+        prop = super(Path, self)._getProperties()
         prop['points'] = tuple(self._points)
         prop['arrows'] = self._arrows
         return prop
@@ -3857,7 +4296,7 @@ class Path(Shape):
 
         """
         self._final = True
-        
+
     def addPoint(self, point, index=-1):
         """Add a new point to the Path.
 
@@ -3953,10 +4392,28 @@ class Path(Shape):
 
         Note: arrows are never displayed for Polygon or ClosedSpline instances
         """
-        self._arrows = (forward,reverse)
-        self._update({'arrows' : self._arrows})
+        self._arrows = (forward, reverse)
+        self._update({'arrows': self._arrows})
 
-class Polygon(Path,FillableShape):
+    def _draw(self):
+        pass        # required for our built-in concrete drawables
+
+    def _addBatchPoints(self, *points):
+        if len(points) == 1:
+            try:
+                points = tuple(points[0])
+            except TypeError:
+                pass   # original parameter might be a single Point
+
+        for p in points:
+            try:
+                self.addPoint(p)
+            except TypeError:
+                raise
+
+
+class Polygon(Path, FillableShape):
+
     """A polygon that can be drawn to a canvas."""
 
     def __init__(self, *points):
@@ -3974,18 +4431,20 @@ class Polygon(Path,FillableShape):
         first point of the polygon.
 
         """
-        FillableShape.__init__(self)
-        try:
-            Path.__init__(self, *points)
-        except TypeError:
-            raise
+        super(Polygon, self).__init__()
+
+        self._addBatchPoints(*points)
 
     def _getProperties(self):    # need aspects of both parents
-        prop = Path._getProperties(self)
-        prop.update(FillableShape._getProperties(self))
+        prop = super(Polygon, self)._getProperties()
         return prop
 
+    def _draw(self):
+        pass        # required for our built-in concrete drawables
+
+
 class Spline(Path):
+
     """A curved path that can be drawn to a canvas."""
 
     def __init__(self, *points):
@@ -4004,17 +4463,25 @@ class Spline(Path):
         point of the spline.
 
         """
+        # Quick solution, check Polygon same code
+        # Better solution: path has private method: _batchPoints takes parameter
+        # points
+        super(Spline, self).__init__()
+
         try:
-            Path.__init__(self, *points)
+            self._addBatchPoints(*points)
         except TypeError:
             raise
 
     def _getProperties(self):
-        prop = Path._getProperties(self)
-        prop['smooth'] = True               # need key, but value is really irrelevant
+        prop = super(Spline, self)._getProperties()
+        # need key, but value is really irrelevant
+        prop['smooth'] = True
         return prop
 
+
 class ClosedSpline(Polygon):
+
     """A closed curve that can be drawn to a canvas."""
 
     def __init__(self, *points):
@@ -4032,17 +4499,22 @@ class ClosedSpline(Polygon):
         first point of the spline.
 
         """
+        super(ClosedSpline, self).__init__()
+
         try:
-            Polygon.__init__(self, *points)
+            self._addBatchPoints(*points)
         except TypeError:
             raise
 
     def _getProperties(self):
-        prop = Polygon._getProperties(self)
-        prop['smooth'] = True               # need key, but value is really irrelevant
+        prop = super(ClosedSpline, self)._getProperties()
+        # need key, but value is really irrelevant
+        prop['smooth'] = True
         return prop
 
+
 class Text(Drawable):
+
     """A piece of text that can be drawn to a canvas."""
 
     def __init__(self, message='', fontsize=12, centerPt=None):
@@ -4062,14 +4534,14 @@ class Text(Drawable):
         """
         if not isinstance(message, basestring):
             raise TypeError('message must be a string')
-        if not isinstance(fontsize, (int,float)):
+        if not isinstance(fontsize, (int, float)):
             raise TypeError('fontsize must be numeric')
         if fontsize <= 0:
             raise ValueError('fontsize must be positive')
         if centerPt and not isinstance(centerPt, Point):
             raise TypeError('center must be a Point')
 
-        Drawable.__init__(self)
+        super(Text, self).__init__()
         self._text = message
         self._size = fontsize
         self._color = Color('black')
@@ -4083,13 +4555,14 @@ class Text(Drawable):
         temp._color = self._color     # do shallow copy
         temp._color._register(temp, 'font color')
         return temp
- 
-    def _draw(self): pass
+
+    def _draw(self):
+        pass        # required for our built-in concrete drawables
 
     def _getProperties(self):
-        prop = Drawable._getProperties(self)
-        prop.update( { 'message' : self._text, 'font color' : Color(self._color),
-                       'font size' : self._size, 'justify' : self._justify } )
+        prop = super(Text, self)._getProperties()
+        prop.update({'message': self._text, 'font color': Color(self._color),
+                     'font size': self._size, 'justify': self._justify})
         return prop
 
     def setMessage(self, message):
@@ -4136,7 +4609,7 @@ class Text(Drawable):
 
     def setFontSize(self, fontsize):
         """Set the font size."""
-        if not isinstance(fontsize, (int,float)):
+        if not isinstance(fontsize, (int, float)):
             raise TypeError('fontsize must be numeric')
         if fontsize <= 0:
             raise ValueError('fontsize must be positive')
@@ -4154,24 +4627,26 @@ class Text(Drawable):
         factor      scale is multiplied by this number (must be positive)
 
         """
-        if not isinstance(factor, (int,float)):
+        if not isinstance(factor, (int, float)):
             raise TypeError('scaling factor must be a positive number')
         if factor <= 0:
             raise ValueError('scaling factor must be a positive number')
 
-        Drawable.scale(self, factor)    # transform is really irrelevant, but leaving this to support TextBox type usage
+        # transform is really irrelevant, but leaving this to support multiple
+        # inheritance between Text and some other shape
+        super(Text, self).scale(factor)
         self._size *= factor
         self._update({'font size': self._size})
 
-    def rotate(self,angle):
+    def rotate(self, angle):
         """Not yet implemented."""
         raise NotImplementedError('rotating text is not yet implemented')
 
-    def stretch(self,xFactor,yFactor,angle=0):
+    def stretch(self, xFactor, yFactor, angle=0):
         """Not yet implemented."""
         raise NotImplementedError('stretching text is not yet implemented')
 
-    def flip(self,angle=0):
+    def flip(self, angle=0):
         """Not yet implemented."""
         raise NotImplementedError('fliping text is not yet implemented')
 
@@ -4181,7 +4656,7 @@ class Text(Drawable):
 
     def getDimensions(self):
         """Return a (width,height) tuple measuring visual dimensions of currently displayed message."""
-        return _graphicsManager.executeFunction( ('get text size', self._text, self._size) )
+        return _graphicsManager.executeFunction(('get text size', self._text, self._size))
 
     def setJustification(self, style):
         """Set the justifcation style for multiline text.
@@ -4198,8 +4673,8 @@ class Text(Drawable):
         self._update({'justify': style})
 
 
-
 class Image(Drawable):
+
     """A wrapper for images that can be drawn to a canvas and manipulated."""
 
     def __init__(self, *args):
@@ -4224,45 +4699,48 @@ class Image(Drawable):
 
         The center of the image is initially aligned with Point(0,0).
         """
-        Drawable.__init__(self)
+        super(Image, self).__init__()
 
         if not 1 <= len(args) <= 2:
-            raise TypeError('must either specify a filename or integer width and height')
+            raise TypeError(
+                'must either specify a filename or integer width and height')
 
         if len(args) == 2:
-            for k in (0,1):
+            for k in (0, 1):
                 if not isinstance(args[k], int):
-                    msg = ('width','height')[k] + ' must be an integer'
+                    msg = ('width', 'height')[k] + ' must be an integer'
                     raise TypeError(msg)
                 if args[k] <= 0:
-                    msg = ('width','height')[k] + ' must be positive'
+                    msg = ('width', 'height')[k] + ' must be positive'
                     raise ValueError(msg)
 
             self._w = args[0]
             self._h = args[1]
             self._data = _array('B', [255]) * (3 * self._w * self._h)
-            self._alpha = _array('B', [0]) * ((self._w * self._h + 7)// 8)   # bitfield (all transparent)
+            # bitfield (all transparent)
+            self._alpha = _array('B', [0]) * ((self._w * self._h + 7) // 8)
             self._image = None
-        
+
         if len(args) == 1:
             # TODO:  add back in base64 encoded strings for initialization? (from KAIST)
             if not isinstance(args[0], basestring):
                 raise TypeError('filename must be a string')
 
-            result = _graphicsManager.executeFunction( ('load image', args[0]) )
+            result = _graphicsManager.executeFunction(('load image', args[0]))
 
             if result is None:
                 raise ValueError('unable to load image file: ' + args[0])
-                
+
             self._image, self._w, self._h = result
             self._data = self._alpha = _array('B')
 
-    def _draw(self): pass
+    def _draw(self):
+        pass        # required for our built-in concrete drawables
 
     def _getProperties(self):
-        prop = Drawable._getProperties(self)
-        prop.update( { 'width' : self._w, 'height' : self._h, 'image' : self._image,
-                       'data' : self._data[:], 'alpha' : self._alpha[:] } )
+        prop = super(Image, self)._getProperties()
+        prop.update({'width': self._w, 'height': self._h, 'image': self._image,
+                     'data': self._data[:], 'alpha': self._alpha[:]})
         return prop
 
     def getWidth(self):
@@ -4272,7 +4750,7 @@ class Image(Drawable):
     def getHeight(self):
         """Return the number of pixels per column in the original coordinate space."""
         return self._h
-    
+
     def getPixel(self, x, y):
         """Returns a copy of the color at the specified pixel."""
         if not isinstance(x, int):
@@ -4283,16 +4761,16 @@ class Image(Drawable):
             raise TypeError('y must be integral')
         if not 0 <= y < self._h:
             raise ValueError('y is invalid index')
-            
-        
+
         if len(self._data) == 0:                 # lazy conversion
             self._data, self._alpha = \
-                        _graphicsManager.executeFunction( ('convert image', self._image) )
+                _graphicsManager.executeFunction(
+                    ('convert image', self._image))
 
         scalar = x + self._w * y
-        a,b = divmod(scalar, 8)
+        a, b = divmod(scalar, 8)
         if self._alpha[a] & (1 << b):
-            return Color(tuple(self._data[3*scalar:3*(scalar+1)]))
+            return Color(tuple(self._data[3 * scalar:3 * (scalar + 1)]))
         else:
             return Color('transparent')
 
@@ -4324,45 +4802,56 @@ class Image(Drawable):
             raise
 
         scalar = x + self._w * y
-        a,b = divmod(scalar, 8)
+        a, b = divmod(scalar, 8)
         if len(self._data) == 0:                 # lazy conversion
             self._data, self._alpha = \
-                        _graphicsManager.executeFunction( ('convert image', self._image) )
+                _graphicsManager.executeFunction(
+                    ('convert image', self._image))
         if c == Color('transparent'):
-            self._alpha[a] &= (255-(1 << b))      # set alpha to zero
+            self._alpha[a] &= (255 - (1 << b))      # set alpha to zero
         else:
             rgb = [int(k) for k in c.getColorValue()]
-            self._data[3*scalar:3*(scalar+1)] = _array('B', rgb)
+            self._data[3 * scalar:3 * (scalar + 1)] = _array('B', rgb)
             self._alpha[a] |= (1 << b)      # set alpha to one
 
     def updatePixels(self):
         """Re-render the image to reflect current pixel settings."""
-        self._update({'data': self._data[:], 'alpha' : self._alpha[:]})
+        self._update({'data': self._data[:], 'alpha': self._alpha[:]})
 
 
 # Rendered shapes
 class _RenderedDrawable(object):
+
     def __init__(self, chain, properties):
         self._chain = chain
-        self._canvas = _graphicsManager._renderedHierarchy.getNode(chain[:1])._renderedDrawable
+        self._canvas = _graphicsManager._renderedHierarchy.getNode(
+            chain[:1])._renderedDrawable
         self._object = None
 
     def putAbove(self, other):
         if other is not None:
+            if _DEBUG['Tkinter'] >= 2:
+                print('calling lift(' + str(self._object) +
+                      ',' + str(other._object) + ')')
             self._canvas._canvas.lift(self._object, other._object)
-        else: # Put at bottom
+        else:  # Put at bottom
+            if _DEBUG['Tkinter'] >= 2:
+                print('calling lower(' + str(self._object) + ')')
             self._canvas._canvas.lower(self._object)
 
     def update(self, properties):
-        if _debug >= 1: print('Updating _RenderedDrawable')
+        if _DEBUG['Tkinter'] >= 2:
+            print('Updating _RenderedDrawable')
         pass
 
     def remove(self):
-      self._canvas._canvas.delete(self._object)
+        self._canvas._canvas.delete(self._object)
+
 
 class _RenderedShape(_RenderedDrawable):
+
     def __init__(self, chain, properties):
-        _RenderedDrawable.__init__(self, chain, properties)
+        super(_RenderedShape, self).__init__(chain, properties)
         self._width = self._transWidth = self._dash = self._borderColor = None
 
     def update(self, properties):
@@ -4382,19 +4871,23 @@ class _RenderedShape(_RenderedDrawable):
                     configs[colorProp] = ''
                     self._transWidth = 0
                 elif self._width == 0:  # changing from zero to nonzero!
-                    configs[colorProp] = Color._getTkColor(properties.get('border color',self._borderColor))
+                    configs[colorProp] = Color._getTkColor(
+                        properties.get('border color', self._borderColor))
                 self._width = w
 
             if w != 0:     # recompute transformed width
-                transform = _graphicsManager._renderedHierarchy.getNode(self._chain)._cumulativeTransformation
+                transform = _graphicsManager._renderedHierarchy.getNode(
+                    self._chain)._cumulativeTransformation
                 self._transWidth = w * transform.scale()
                 configs['width'] = self._transWidth
 
                 if self._dash is not None and self._dash[1] != 0:
-                    a = min(255, max(1, int(round(self._dash[0]*self._transWidth/self._width))))
-                    b = min(255, max(1, int(round(self._dash[1]*self._transWidth/self._width))))
+                    a = min(
+                        255, max(1, int(round(self._dash[0] * self._transWidth / self._width))))
+                    b = min(
+                        255, max(1, int(round(self._dash[1] * self._transWidth / self._width))))
                     # for some reason, (a,b,a,b) tuple works better than (a,b) tuple for Tkinter
-                    configs['dash'] = (a,b) * _dashMultiplier
+                    configs['dash'] = (a, b) * _dashMultiplier
 
         if 'border color' in properties:
             self._borderColor = properties['border color']
@@ -4407,100 +4900,128 @@ class _RenderedShape(_RenderedDrawable):
             if self._dash[1] == 0:
                 configs['dash'] = ''
             else:
-                a = min(255, max(1, int(round(self._dash[0]*self._transWidth/self._width))))
-                b = min(255, max(1, int(round(self._dash[1]*self._transWidth/self._width))))
+                a = min(
+                    255, max(1, int(round(self._dash[0] * self._transWidth / self._width))))
+                b = min(
+                    255, max(1, int(round(self._dash[1] * self._transWidth / self._width))))
                 # for some reason, (a,b,a,b) tuple works better than (a,b) tuple for Tkinter
-                configs['dash'] = (a,b) * _dashMultiplier
+                configs['dash'] = (a, b) * _dashMultiplier
 
         self._canvas._canvas.itemconfigure(self._object, **configs)
         _RenderedDrawable.update(self, properties)
 
+
 class _RenderedFillableShape(_RenderedShape):
+
     def __init__(self, chain, properties):
-        _RenderedShape.__init__(self, chain, properties)
+        super(_RenderedFillableShape, self).__init__(chain, properties)
         self._fillColor = None
 
     def update(self, properties):
         if 'fill color' in properties:
             self._fillColor = properties['fill color']
-            self._canvas._canvas.itemconfigure(self._object, fill=Color._getTkColor(self._fillColor))
+            self._canvas._canvas.itemconfigure(
+                self._object, fill=Color._getTkColor(self._fillColor))
         _RenderedShape.update(self, properties)
 
+
 class _RenderedCircle(_RenderedFillableShape):
+
     def __init__(self, chain, properties):
-        _RenderedFillableShape.__init__(self, chain, properties)
-        transform = _graphicsManager._renderedHierarchy.getNode(chain)._cumulativeTransformation
+        super(_RenderedCircle, self).__init__(chain, properties)
+        transform = _graphicsManager._renderedHierarchy.getNode(
+            chain)._cumulativeTransformation
         points = []
-        for i in range(0,360,5):
-            points.append(Point(1,0) ^ i)
+        for i in range(0, 360, 5):
+            points.append(Point(1, 0) ^ i)
         statement = 'self._object = self._canvas._canvas.create_polygon('
         for p in points:
-            statement += str(transform.image(p).getX()) + ', ' + str(transform.image(p).getY()) + ', '
+            statement += str(transform.image(p).getX()) + \
+                ', ' + str(transform.image(p).getY()) + ', '
         statement += 'smooth=1)'
         exec(statement)
-        _graphicsManager._objectIdRegistry[(self._canvas._canvas,self._object)] = self
+        _graphicsManager._objectIdRegistry[(
+            self._canvas._canvas, self._object)] = self
 
         _RenderedFillableShape.update(self, properties)
 
     def update(self, properties):
         if 'transformation' in properties:
-            transform = _graphicsManager._renderedHierarchy.getNode(self._chain)._cumulativeTransformation
+            transform = _graphicsManager._renderedHierarchy.getNode(
+                self._chain)._cumulativeTransformation
 
             points = []
-            for i in range(0,360,5):
-                points.append(Point(1,0) ^ i)
+            for i in range(0, 360, 5):
+                points.append(Point(1, 0) ^ i)
             statement = 'self._canvas._canvas.coords(self._object'
             for p in points:
-                statement += ', ' + str(transform.image(p).getX()) + ', ' + str(transform.image(p).getY())
+                statement += ', ' + \
+                    str(transform.image(p).getX()) + ', ' + \
+                    str(transform.image(p).getY())
             statement += ')'
 
             exec(statement)
 
         _RenderedFillableShape.update(self, properties)
 
-class _RenderedRectangle(_RenderedFillableShape):
-    def __init__(self, chain, properties):
-        _RenderedFillableShape.__init__(self, chain, properties)
-        transform = _graphicsManager._renderedHierarchy.getNode(self._chain)._cumulativeTransformation
 
-        points = [Point(-.5,-.5), Point(-.5,.5), Point(.5,.5), Point(.5,-.5)]
+class _RenderedRectangle(_RenderedFillableShape):
+
+    def __init__(self, chain, properties):
+        super(_RenderedRectangle, self).__init__(chain, properties)
+        transform = _graphicsManager._renderedHierarchy.getNode(
+            self._chain)._cumulativeTransformation
+
+        points = [Point(-.5, -.5), Point(-.5, .5),
+                  Point(.5, .5), Point(.5, -.5)]
         for i in range(4):
             points[i] = transform.image(points[i])
-        self._object = self._canvas._canvas.create_polygon(points[0].get(), points[1].get(), points[2].get(), points[3].get())
-        _graphicsManager._objectIdRegistry[(self._canvas._canvas,self._object)] = self
+        self._object = self._canvas._canvas.create_polygon(
+            points[0].get(), points[1].get(), points[2].get(), points[3].get())
+        _graphicsManager._objectIdRegistry[(
+            self._canvas._canvas, self._object)] = self
         _RenderedFillableShape.update(self, properties)
 
     def update(self, properties):
         if 'transformation' in properties:
-            transform = _graphicsManager._renderedHierarchy.getNode(self._chain)._cumulativeTransformation
-            points = [Point(-.5,-.5), Point(-.5,.5), Point(.5,.5), Point(.5,-.5)]
+            transform = _graphicsManager._renderedHierarchy.getNode(
+                self._chain)._cumulativeTransformation
+            points = [Point(-.5, -.5), Point(-.5, .5),
+                      Point(.5, .5), Point(.5, -.5)]
             for i in range(4):
                 points[i] = transform.image(points[i])
             self._canvas._canvas.coords(self._object, points[0].getX(), points[0].getY(), points[1].getX(), points[1].getY(),
                                         points[2].getX(), points[2].getY(), points[3].getX(), points[3].getY())
         _RenderedFillableShape.update(self, properties)
 
+
 class _RenderedPath(_RenderedShape):
+
     def __init__(self, chain, properties):
-        _RenderedShape.__init__(self, chain, properties)
-        transform = _graphicsManager._renderedHierarchy.getNode(self._chain)._cumulativeTransformation
+        super(_RenderedPath, self).__init__(chain, properties)
+        transform = _graphicsManager._renderedHierarchy.getNode(
+            self._chain)._cumulativeTransformation
         self._points = properties['points']
 
         if len(self._points) > 1:
-            tkPts = [(transform.image(p).getX(),transform.image(p).getY()) for p in self._points]
+            tkPts = [(transform.image(p).getX(), transform.image(p).getY())
+                     for p in self._points]
         else:
-            tkPts = [(0,0)] * 3
+            tkPts = [(0, 0)] * 3
         self._object = self._canvas._canvas.create_line(tkPts)
-        _graphicsManager._objectIdRegistry[(self._canvas._canvas,self._object)] = self
+        _graphicsManager._objectIdRegistry[(
+            self._canvas._canvas, self._object)] = self
         _RenderedShape.update(self, properties)
         configs = {}
         if 'smooth' in properties:
             configs['smooth'] = 1
 
         if 'arrows' in properties:
-            transform = _graphicsManager._renderedHierarchy.getNode(self._chain)._cumulativeTransformation
-            w = transform.scale()*properties['border width']
-            configs['arrowshape'] = str(w*8) + ' ' + str(w*10) + ' ' + str(w*3)
+            transform = _graphicsManager._renderedHierarchy.getNode(
+                self._chain)._cumulativeTransformation
+            w = transform.scale() * properties['border width']
+            configs['arrowshape'] = str(
+                w * 8) + ' ' + str(w * 10) + ' ' + str(w * 3)
             pair = properties['arrows']
             if pair[0] and pair[1]:
                 configs['arrow'] = 'both'
@@ -4509,11 +5030,10 @@ class _RenderedPath(_RenderedShape):
             elif pair[1]:
                 configs['arrow'] = 'first'
         if not self._points:      # make effectively invisible TK object with width 0
-            configs.update( {'fill' : None, 'width' : 0} )
+            configs.update({'fill': None, 'width': 0})
 
         if configs:
             self._canvas._canvas.itemconfigure(self._object, **configs)
-
 
     def update(self, properties):
         _RenderedShape.update(self, properties)
@@ -4522,10 +5042,12 @@ class _RenderedPath(_RenderedShape):
 
         if 'transformation' in properties or 'points' in properties:
             wasEmpty = len(self._points) < 2
-            self._points = properties.get('points', self._points)   # update if given
+            self._points = properties.get(
+                'points', self._points)   # update if given
 
             if len(self._points) > 1:
-                transform = _graphicsManager._renderedHierarchy.getNode(self._chain)._cumulativeTransformation
+                transform = _graphicsManager._renderedHierarchy.getNode(
+                    self._chain)._cumulativeTransformation
                 tkCoords = []
                 for p in self._points:
                     tkCoords.append(transform.image(p).getX())
@@ -4536,11 +5058,12 @@ class _RenderedPath(_RenderedShape):
                     configs['fill'] = Color._getTkColor(self._borderColor)
             else:
                 tkCoords = 6 * (0,)
-            self._canvas._canvas.coords(self._object,tuple(tkCoords))
+            self._canvas._canvas.coords(self._object, tuple(tkCoords))
 
         if 'transformation' in properties or 'border width' in properties:
             w = self._transWidth
-            configs['arrowshape'] = str(w*8) + ' ' + str(w*10) + ' ' + str(w*3)
+            configs['arrowshape'] = str(
+                w * 8) + ' ' + str(w * 10) + ' ' + str(w * 3)
 
         if 'arrows' in properties:
             pair = properties['arrows']
@@ -4554,39 +5077,47 @@ class _RenderedPath(_RenderedShape):
                 configs['arrow'] = 'none'
 
         if not self._points:      # make effectively invisible TK object with width 0
-            configs.update( {'fill' : None, 'width' : 0} )
+            configs.update({'fill': None, 'width': 0})
 
         if configs:
             self._canvas._canvas.itemconfigure(self._object, **configs)
 
+
 class _RenderedPolygon(_RenderedFillableShape):
+
     def __init__(self, chain, properties):
-        _RenderedFillableShape.__init__(self, chain, properties)
-        transform = _graphicsManager._renderedHierarchy.getNode(self._chain)._cumulativeTransformation
+        super(_RenderedPolygon, self).__init__(chain, properties)
+        transform = _graphicsManager._renderedHierarchy.getNode(
+            self._chain)._cumulativeTransformation
         self._points = properties['points']
 
         if len(self._points) > 1:
-            tkPts = [(transform.image(p).getX(),transform.image(p).getY()) for p in self._points]
+            tkPts = [(transform.image(p).getX(), transform.image(p).getY())
+                     for p in self._points]
         else:
-            tkPts = [(0,0)] * 3
+            tkPts = [(0, 0)] * 3
         self._object = self._canvas._canvas.create_polygon(tkPts)
-        _graphicsManager._objectIdRegistry[(self._canvas._canvas,self._object)] = self
+        _graphicsManager._objectIdRegistry[(
+            self._canvas._canvas, self._object)] = self
         if 'smooth' in properties:
             self._canvas._canvas.itemconfigure(self._object, smooth=1)
         _RenderedFillableShape.update(self, properties)
         if not self._points:      # make effectively invisible TK object with width 0
-            self._canvas._canvas.itemconfigure(self._object, fill=None, width=0)
+            self._canvas._canvas.itemconfigure(
+                self._object, fill=None, width=0)
 
     def update(self, properties):
         _RenderedFillableShape.update(self, properties)
         configs = {}
 
         if 'transformation' in properties or 'points' in properties:
-            wasEmpty = len(self._points)  < 2
-            self._points = properties.get('points', self._points)   # update if given
+            wasEmpty = len(self._points) < 2
+            self._points = properties.get(
+                'points', self._points)   # update if given
 
             if len(self._points) > 1:
-                transform = _graphicsManager._renderedHierarchy.getNode(self._chain)._cumulativeTransformation
+                transform = _graphicsManager._renderedHierarchy.getNode(
+                    self._chain)._cumulativeTransformation
                 tkCoords = []
                 for p in self._points:
                     tkCoords.append(transform.image(p).getX())
@@ -4598,126 +5129,160 @@ class _RenderedPolygon(_RenderedFillableShape):
                     configs['fill'] = Color._getTkColor(self._fillColor)
             else:
                 tkCoords = 6 * (0,)
-            self._canvas._canvas.coords(self._object,tuple(tkCoords))
+            self._canvas._canvas.coords(self._object, tuple(tkCoords))
 
         if not self._points:      # make effectively invisible TK object with width 0
-            configs.update( {'fill' : None, 'width' : 0} )
+            configs.update({'fill': None, 'width': 0})
 
         if configs:
             self._canvas._canvas.itemconfigure(self._object, **configs)
 
+
 class _RenderedText(_RenderedDrawable):
 
-    normalFactor = 1.0    # re-configured at startup so that 12pt font has approximate height 16-pixels (96 PPI)
-    
+    # re-configured at startup so that 12pt font has approximate height 16-pixels (96 PPI)
+    normalFactor = 1.0
+
     def __init__(self, chain, properties):
-        _RenderedDrawable.__init__(self, chain, properties)
-        transform = _graphicsManager._renderedHierarchy.getNode(chain)._cumulativeTransformation
-        parentTransform = _graphicsManager._renderedHierarchy.getNode(chain[:-1])._cumulativeTransformation
+        super(_RenderedText, self).__init__(chain, properties)
+        transform = _graphicsManager._renderedHierarchy.getNode(
+            chain)._cumulativeTransformation
+        parentChain = self._getParentChain()
+        parentTransform = _graphicsManager._renderedHierarchy.getNode(
+            parentChain)._cumulativeTransformation
         parentScale = parentTransform.scale()
-        if not transform.scaleAndTranslate() and parentScale > 0:
-            raise GraphicsError('text cannot be rotated or sheared unless Python Image Library is installed', True)
-        center = transform.image(Point(0.,0.))
+        if not parentTransform.scaleAndTranslate() and parentScale > 0:
+            raise GraphicsError(
+                'text cannot be rotated or sheared unless Python Image Library is installed', True)
+        center = transform.image(Point(0., 0.))
         self._renderedSize = properties['font size']
-        actualSize = int(round(parentScale * self._renderedSize * _RenderedText.normalFactor))
+        actualSize = int(
+            round(parentScale * self._renderedSize * _RenderedText.normalFactor))
         self._object = self._canvas._canvas.create_text(center.get(), text=properties['message'],
                                                         anchor='center', justify=properties['justify'],
-                                                        fill=Color._getTkColor(properties['font color']),
-                                                        font=('Helvetica', actualSize, 'normal') )
-        _graphicsManager._objectIdRegistry[(self._canvas._canvas,self._object)] = self
+                                                        fill=Color._getTkColor(
+                                                            properties['font color']),
+                                                        font=('Helvetica', actualSize, 'normal'))
+        _graphicsManager._objectIdRegistry[(
+            self._canvas._canvas, self._object)] = self
 
         _RenderedDrawable.update(self, properties)
 
+    def _getParentChain(self):
+        """Determine proper parent chain considering possible inheritance model."""
+        parentChain = chain = self._chain
+        while parentChain and parentChain[-1][0] is chain[-1][0]:
+            # when subclass of text exists, go back in chain until beyond that object's entries
+            parentChain = parentChain[:-1]
+        return parentChain
+
     def update(self, properties):
         if 'message' in properties:
-            self._canvas._canvas.itemconfigure(self._object, text=properties['message'])
+            self._canvas._canvas.itemconfigure(
+                self._object, text=properties['message'])
 
         if 'font color' in properties:
-            self._canvas._canvas.itemconfigure(self._object, fill=Color._getTkColor(properties['font color']))
-            
+            self._canvas._canvas.itemconfigure(
+                self._object, fill=Color._getTkColor(properties['font color']))
+
         if 'justify' in properties:
-            self._canvas._canvas.itemconfigure(self._object, justify=properties['justify'])
-            
+            self._canvas._canvas.itemconfigure(
+                self._object, justify=properties['justify'])
+
         if 'font size' in properties:
             self._renderedSize = properties['font size']
             # will handle the actual resizeing of tkinter in a moment...
 
         if 'font size' in properties or 'transformation' in properties:
             # determine effective size
-            parentTransform = _graphicsManager._renderedHierarchy.getNode(self._chain[:-1])._cumulativeTransformation
+            parentChain = self._getParentChain()
+            parentTransform = _graphicsManager._renderedHierarchy.getNode(
+                parentChain)._cumulativeTransformation
             parentScale = parentTransform.scale()
             if parentScale < 0:
-#                raise GraphicsError('text cannot be reflected unless Python Image Library is installed', True)
+                #                raise GraphicsError('text cannot be reflected unless Python Image Library is installed', True)
                 raise GraphicsError('text cannot be reflected', True)
-            actualSize = int(round(parentScale * self._renderedSize * _RenderedText.normalFactor))
-            self._canvas._canvas.itemconfigure(self._object, font=('Helvetica', actualSize, 'normal'))
+            actualSize = int(
+                round(parentScale * self._renderedSize * _RenderedText.normalFactor))
+            self._canvas._canvas.itemconfigure(
+                self._object, font=('Helvetica', actualSize, 'normal'))
 
         if 'transformation' in properties:
             # consider translation of text center
-            transform = _graphicsManager._renderedHierarchy.getNode(self._chain)._cumulativeTransformation
-            if not transform.scaleAndTranslate():
-#                raise GraphicsError('text cannot be rotated or sheared unless Python Image Library is installed', True)
+            parentChain = self._getParentChain()
+            parentTransform = _graphicsManager._renderedHierarchy.getNode(
+                parentChain)._cumulativeTransformation
+            if not parentTransform.scaleAndTranslate():
+                #                raise GraphicsError('text cannot be rotated or sheared unless Python Image Library is installed', True)
                 raise GraphicsError('text cannot be rotated or sheared', True)
-            center = transform.image(Point(0.,0.))
-            self._canvas._canvas.coords(self._object, center.getX(), center.getY())
-
+            transform = _graphicsManager._renderedHierarchy.getNode(
+                self._chain)._cumulativeTransformation
+            center = transform.image(Point(0., 0.))
+            self._canvas._canvas.coords(
+                self._object, center.getX(), center.getY())
 
         _RenderedDrawable.update(self, properties)
+
 
 class _RenderedImage(_RenderedDrawable):
     # need to make sure that this instance buffers the most recently used
     # image, transform, and (data,alpha) arrays.
-    
+
     def __init__(self, chain, properties):
-        _RenderedDrawable.__init__(self, chain, properties)
+        super(_RenderedImage, self).__init__(chain, properties)
 
         self._w = properties['width']            # needed for _buildImage
         self._h = properties['height']
         self._lastData = self._lastAlpha = None
 
-        transform = _graphicsManager._renderedHierarchy.getNode(chain)._cumulativeTransformation
-        center = transform.image(Point(0.,0.))
+        transform = _graphicsManager._renderedHierarchy.getNode(
+            chain)._cumulativeTransformation
+        center = transform.image(Point(0., 0.))
 
         if properties['data'] or not transform.translateOnly():
             # will need to construct image manually
             if properties['data']:
-                data,alpha = properties['data'], properties['alpha']
+                data, alpha = properties['data'], properties['alpha']
             else:
-                data,alpha = _convertImage(properties['image'])
-            self._lastData, self._lastAlpha = data,alpha
+                data, alpha = _convertImage(properties['image'])
+            self._lastData, self._lastAlpha = data, alpha
             img = self._buildImage(data, alpha, transform)
         else:
             img = properties['image']
 
         self._lastCumulative = transform    # used to recognize translationOnly updates
         self._lastImage = img               # keep reference to avoid garbage collection
-        self._object = self._canvas._canvas.create_image(center.get(), image=img, anchor='center')
-        _graphicsManager._objectIdRegistry[(self._canvas._canvas,self._object)] = self
+        self._object = self._canvas._canvas.create_image(
+            center.get(), image=img, anchor='center')
+        _graphicsManager._objectIdRegistry[(
+            self._canvas._canvas, self._object)] = self
         _RenderedDrawable.update(self, properties)
 
     def update(self, properties):
         mustRebuild = 'data' in properties
         if mustRebuild or 'transformation' in properties:
-            transform = _graphicsManager._renderedHierarchy.getNode(self._chain)._cumulativeTransformation
+            transform = _graphicsManager._renderedHierarchy.getNode(
+                self._chain)._cumulativeTransformation
             delta = transform * self._lastCumulative.inv()
             mustRebuild = mustRebuild or not delta.translateOnly()
             self._lastCumulative = transform
 
             if not mustRebuild:
                 # can get away with simple translation with existing image
-                center = transform.image(Point(0.,0.))
-                self._canvas._canvas.coords(self._object, center.getX(), center.getY())
+                center = transform.image(Point(0., 0.))
+                self._canvas._canvas.coords(
+                    self._object, center.getX(), center.getY())
 
         if mustRebuild:
             if 'data' in properties:
-                data,alpha = properties['data'], properties['alpha']
+                data, alpha = properties['data'], properties['alpha']
             elif self._lastData is not None:
-                data,alpha = self._lastData, self._lastAlpha
+                data, alpha = self._lastData, self._lastAlpha
             else:
-                data,alpha = _convertImage(self._lastImage)
-            self._lastData, self._lastAlpha = data,alpha
+                data, alpha = _convertImage(self._lastImage)
+            self._lastData, self._lastAlpha = data, alpha
             self._image = self._buildImage(data, alpha, transform)
-            center = transform.image(Point(0,0))
+            center = transform.image(Point(0, 0))
             self._canvas._canvas.itemconfigure(self._object, image=self._image)
 
         _RenderedDrawable.update(self, properties)
@@ -4726,8 +5291,8 @@ class _RenderedImage(_RenderedDrawable):
         """Returns a new PhotoImage instance based on the transformed low-level data arrays."""
         # TODO: find ways to batch so that there are less individual calls to img.put
         minX = maxX = minY = maxY = None
-        for x,y in ( (self._w,0), (0,self._h), (self._w,self._h), (0,0)):   # do origin last!
-            p = transform.image(Point(x,y))
+        for x, y in ((self._w, 0), (0, self._h), (self._w, self._h), (0, 0)):   # do origin last!
+            p = transform.image(Point(x, y))
             if minX is None or minX > p.getX():
                 minX = p.getX()
             if maxX is None or maxX < p.getX():
@@ -4736,27 +5301,32 @@ class _RenderedImage(_RenderedDrawable):
                 minY = p.getY()
             if maxY is None or maxY < p.getY():
                 maxY = p.getY()
-        offset = Point(p.getX()-minX, p.getY()-minY)
-        rW = int(round(maxX-minX))
-        rH = int(round(maxY-minY))
+        offset = Point(p.getX() - minX, p.getY() - minY)
+        rW = int(round(maxX - minX))
+        rH = int(round(maxY - minY))
         img = _Tkinter.PhotoImage(width=rW, height=rH)
-        img.blank()   # TODO: is this necessary for newly constructed image?  
+        img.blank()   # TODO: is this necessary for newly constructed image?
 
         for y in range(rH):
             for x in range(rW):
-                result = transform.inv().image(Point(x+minX,y+minY))
+                result = transform.inv().image(Point(x + minX, y + minY))
                 # no anti-aliasing in this version
-                vx = int(round(result.getX()))      
+                vx = int(round(result.getX()))
                 vy = int(round(result.getY()))
                 if 0 <= vx < self._w and 0 <= vy < self._h:
-                    a,b = divmod(self._w * vy + vx, 8)
+                    a, b = divmod(self._w * vy + vx, 8)
                     if alpha[a] & (1 << b):
-                        color = '#%02x%02x%02x'%tuple(data[3*(vx+self._w*vy):3*(1+vx+self._w*vy)])
-                        img.put(data=color, to=(x,y))
+                        color = '#%02x%02x%02x' % tuple(
+                            data[3 * (vx + self._w * vy):3 * (1 + vx + self._w * vy)])
+                        img.put(data=color, to=(x, y))
         return img
 
 # Library initialization and shutdown
+
+
 def _initLibrary():
+    if _DEBUG['Tkinter'] >= 2:
+        print('Initializing the Tkinter library')
     global _tkroot
     try:
         _tkroot = _Tkinter.Tk()
@@ -4766,8 +5336,13 @@ def _initLibrary():
         raise Exception('unable to start Tkinter on your system')
         _graphicsManager._state = 'Failed'
     _tkroot.withdraw()
+    if _DEBUG['Tkinter'] > 2:
+        print('actual getting set to _getTextSize')
     actual = _getTextSize('X', 36)[1]
-    _RenderedText.normalFactor *= 48.0 / actual  # this normalizes so that 36-pt font has 48-pixel height (96 PPI)
+
+    # this normalizes so that 36-pt font has 48-pixel height (96 PPI)
+    _RenderedText.normalFactor *= 48.0 / actual
+
 
 def _startCommandThread():
     _initLibrary()
@@ -4777,20 +5352,30 @@ def _startCommandThread():
         _tkroot.update()
         _time.sleep(.01)
 
+
 def _stopCommandThread():
     while len(_graphicsManager._openCanvases) > 0:
         _time.sleep(.25)
     _graphicsManager._state = 'Stopped'
     _time.sleep(.25)
-    
+
+
 def _exitMainThread():
     # Main loop will return when all open canvases closed
     if _graphicsManager._handlingEvents == 'No':
         _graphicsManager._handlingEvents = 'Yes'
     if len(_graphicsManager._openCanvases) > 0:
-        print('Close canvas windows to end program.')
-        _graphicsManager.mainLoop(None, True)
-    
+        if not _elice_use:
+            print('Close canvas windows to end program.')
+            _graphicsManager.mainLoop(None, True)
+        else:
+            print('Drawing is done and program will be terminated after 4 seconds.')
+            _graphicsManager.addPeriodicHandler(_graphicsManager, 4000, lambda obj: obj._closeAll(),
+                                                immediately=False,
+                                                repeat=False)
+            _graphicsManager.mainLoop(None, True)
+
+
 def startEventHandling():
     """
     Blocks the main thread and enters event-handling mode.
@@ -4800,17 +5385,19 @@ def startEventHandling():
     Note: This should not be called if using native threading.
     """
     if not _nativeThreading:
-      if _graphicsManager._handlingEvents == 'No':
-          _graphicsManager._handlingEvents = 'Yes'
-      _graphicsManager.mainLoop()
-    
+        if _graphicsManager._handlingEvents == 'No':
+            _graphicsManager._handlingEvents = 'Yes'
+        _graphicsManager.mainLoop()
+
+
 def stopEventHandling():
     """
     Counteracts an earlier call to startEventHandling().
     """
     if not _nativeThreading:
-      if _graphicsManager._handlingEvents == 'Yes':
-          _graphicsManager._handlingEvents = 'No'
+        if _graphicsManager._handlingEvents == 'Yes':
+            _graphicsManager._handlingEvents = 'No'
+
 
 _graphicsManager = _GraphicsManager()
 
@@ -4819,14 +5406,17 @@ _graphicsManager = _GraphicsManager()
 # and subsequently to support calls to Text.getDimensions()
 # it presumes that the lock is already held for the graphics thread
 def _getTextSize(message, fontsize):
+    if _DEBUG['Tkinter'] >= 2:
+        print('Tkinter inside _getTextSize')
     tkWin = _Tkinter.Toplevel()
     canvas = _Tkinter.Canvas(tkWin)
     size = int(round(fontsize * _RenderedText.normalFactor))
-    i = canvas.create_text(0, 0, text=message, font=('Helvetica', size, 'normal') )
+    i = canvas.create_text(
+        0, 0, text=message, font=('Helvetica', size, 'normal'))
     bbox = canvas.bbox(i)
     canvas.delete(i)
     tkWin.withdraw()
-    return (bbox[2]-bbox[0],bbox[3]-bbox[1])
+    return (bbox[2] - bbox[0], bbox[3] - bbox[1])
 
 
 # Utility for Image Processing
@@ -4841,20 +5431,206 @@ def _convertImage(img):
     """
     w = img.width()
     h = img.height()
-    a = _array('B', [0]) * (3*w*h)
-    t = _array('B', [255]) * ((w*h+7)//8)     # all True, for lack of better idea
+    a = _array('B', [0]) * (3 * w * h)
+    # all True, for lack of better idea
+    t = _array('B', [255]) * ((w * h + 7) // 8)
     for x in range(w):
         for y in range(h):
-            color = img.get(x,y)
-            base = 3 * (y*w + x)
-            a[base:base+3] = _array('B', [int(v) for v in color.split()])
+            color = img.get(x, y)
+            base = 3 * (y * w + x)
+            a[base:base + 3] = _array('B', [int(v) for v in color.split()])
 
             # appears to be no way to differentiate between black and transparent in this context
             # If we knew it was transparent, the following is the proper code.
-#            if color == '0 0 0':          
+#            if color == '0 0 0':
 #                u,v = divmod(y*w+x,8)
-#                t[u] &= (255 - (1 << v))   # make transparent
-    return (a,t)
-    
+# t[u] &= (255 - (1 << v))   # make transparent
+    return (a, t)
 
-# TODO timer, etc.
+
+class Button(Text, Rectangle, EventHandler):
+
+    """A button that can respond to events."""
+
+    def __init__(self, message='', centerPt=None):
+        """Create a new button.
+
+        The width and height of the button automatically adjust
+        to the size of the displayed text.
+
+        message   the text to display on the button
+        centerPt  where to place the center of the button
+        """
+        super(Button, self).__init__()
+        self.setMessage(message)        # automatically resizes rectangle
+        if centerPt is not None:
+            self.moveTo(centerPt.getX(), centerPt.getY())
+        self._baseBorderWidth = self._borderWidth
+
+        self.setFillColor('white')
+        self.addHandler(self)
+
+    def _resize(self):
+        w, h = self.getDimensions()
+        self.setWidth(w + self._size)
+        self.setHeight(h + self._size)
+
+    def handle(self, event):
+        """Highlight the button when the button is clicked."""
+        if _DEBUG['Events'] >= 3:
+            print('Button self handler')
+        if event._eventType == 'mouse click':
+            Rectangle.setBorderWidth(self, self._baseBorderWidth + 2)
+        elif event._eventType == 'mouse release':
+            Rectangle.setBorderWidth(self, self._baseBorderWidth)
+
+    def _draw(self):
+        Rectangle._draw(self)
+        Text._draw(self)
+
+    def setBorderWidth(self, width):
+        """
+        Set the width of the border to the indicated width.
+        """
+        self._baseBorderWidth = width
+        Rectangle.setBorderWidth(self, width)
+
+    def scale(self, factor):
+        """Scale the object relative to its current reference point.
+
+        factor      scale is multiplied by this number (must be positive)
+        """
+        self._baseBorderWidth *= width
+        super(Button, self).scale(factor)
+
+    def setMessage(self, message):
+        """Changes the button's text to message and automatically resizes the button."""
+        Text.setMessage(self, message)
+        self._resize()
+
+    def setFontSize(self, fontsize):
+        """Changes the button's text size and automatically resizes the button."""
+        Text.setFontSize(self, fontsize)
+        self._resize()
+
+
+class TextBox(Text, Rectangle, EventHandler):
+
+    """Widget for text entry."""
+
+    def __init__(self, width=100, height=50, centerPt=None):
+        """Construct a box to enter text into.
+
+        width     the width of the box
+        height    the height of the box
+        centerPt  the location of the boxes center
+        """
+        super(TextBox, self).__init__()
+        self.setWidth(width)
+        self.setHeight(height)
+        if centerPt is not None:
+            self.moveTo(centerPt.getX(), centerPt.getY())
+        # rectangle interior was transparent by default
+        self.setFillColor('white')
+        self.addHandler(self)
+
+    def _draw(self):
+        # access the overridden Rectangle version of _draw
+        Rectangle._draw(self)
+        # access the overridden Text version of _draw
+        Text._draw(self)
+
+    def handle(self, event):
+        """When the text box is in focus append any keypress to the display text."""
+        if event._eventType == 'keyboard':
+            if event.getKey() == '\b':
+                self.setMessage(self.getMessage()[:-1])
+            else:
+                self.setMessage(self.getMessage() + event.getKey())
+
+
+class Timer(_EventTrigger):
+
+    """A widget for generating one or more cs1graphics events based on a time delay
+
+    By default, a timer generates a single event once started, after a given interval of time passes.
+    A recurring timer with a given period can be generated by means of an optional parameter to the constructor.
+    """
+
+    def __init__(self, delay, repeat=False):
+        """Generate a new Timer object.
+
+        delay    the amount of time, in seconds, before the alarm triggers once started
+        repeat   if False (the default), the timer will only generate one event
+                 if True, the timer will be recurring once started, generating periodic events
+        """
+        super(Timer, self).__init__()
+        self._delay = delay
+        self._repeat = repeat
+        self._running = False
+        self._handlers = list()
+
+    def start(self):
+        if not self._running:
+            self._forceStart()
+
+    def _forceStart(self):
+        self._running = True
+        self._thread = _TimerThread(self, self._delay)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+
+    def addHandler(self, handler):
+        if not isinstance(handler, EventHandler):
+            raise TypeError(
+                'Only child classes of EventHandler can handle events')
+        if handler not in self._handlers:
+            self._handlers.append(handler)
+        else:
+            raise ValueError('Handler is already associated to the shape')
+
+    def removeHandler(self, handler):
+        if handler in self._handlers:
+            self._handlers.remove(handler)
+        else:
+            raise ValueError(
+                'Cannot remove hander from shape it is not associated to')
+
+
+class _TimerThread(_threading.Thread):
+
+    def __init__(self, timer, delay):
+        super(_TimerThread, self).__init__()
+        self._timer = timer
+        self._delay = delay
+
+    def run(self):
+        _time.sleep(self._delay)
+        if self._timer._repeat and self._timer._running:
+            self._timer._forceStart()
+        if self._timer._running:
+            for handler in self._timer._handlers:
+                e = Event()
+                e._eventType = 'timer'
+                handler.handle(e)
+
+
+class Monitor(object):
+
+    """Monitor class for thread synchronization."""
+
+    def __init__(self):
+        """Create a new monitor instance."""
+        self._lock = _threading.Lock()
+        self._lock.acquire()
+
+    def wait(self):
+        """Wait for the monitor to be released by another thread."""
+        self._lock.acquire()
+
+    def release(self):
+        """Release a thread that is waiting on the monitor."""
+        if self._lock.locked():
+            self._lock.release()
