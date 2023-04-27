@@ -1,7 +1,29 @@
 Metadata-Version: 2.1
 Name: cs1-robots
-Version: 0.1.6
-Home-page: 
+Version: 0.1.6.2
+Home-page: https://github.com/hunderaweke/cs1
 Author: David Letscher and Michael H. Goldwasser
-Author-email: 
+Author-email: hunderaweke@gmail.com
 Keywords: cs1robots
+
+# Cs1 
+This is a cs1 modules that used in ASTU for pip installation
+
+> For installation  
+
+```
+pip install cs1-robots
+```
+### Sample for the robots module usage 
+
+```
+from cs1robots import *
+create_world()
+hubo = Robot()
+```
+
+### This code will Result in the following small window
+
+!['./images/sample.png'](./images/sample.png)
+
+## Enjoy Your life with python 3.x all cs1 modules.
